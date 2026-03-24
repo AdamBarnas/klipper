@@ -528,6 +528,7 @@ class EddyTap:
     def _prep_trigger_analog_tap(self, gcmd):
         if not self._tap_threshold:
             raise self._printer.command_error("Tap not configured")
+        params = self._param_helper.get_probe_params(gcmd)
         # Setup mcu filter (scale internal values to milli-hz)
         sos_filter = self._trigger_analog.get_sos_filter()
         sos_filter.set_filter_design(self._filter_design)
@@ -538,8 +539,9 @@ class EddyTap:
         # Set mcu trigger to tap_threshold
         tap_threshold = gcmd.get_float("TAP_THRESHOLD",
                                        self._tap_threshold, above=0.)
-        samp_thresh = int(FRAC_HZ * tap_threshold + 0.5)
-        self._trigger_analog.set_trigger('diff_peak_gt', samp_thresh)
+        sps = self._sensor_helper.get_samples_per_second()
+        samp_thresh = FRAC_HZ * tap_threshold * params['probe_speed'] / sps
+        self._trigger_analog.set_trigger('diff_peak_gt', int(samp_thresh + .5))
         self._current_tap_threshold = tap_threshold
     # Measurement analysis to determine "tap" position
     def _validate_samples_time(self, measures, start_time, end_time):
@@ -704,7 +706,7 @@ class EddyTap:
         return final_coeffs
     def _error_detect(self, msg):
         raise self._printer.command_error("Unable to detect tap: %s" % (msg,))
-    def _analyze_pullback(self, measures, start_time, end_time, speed):
+    def _analyze_pullback(self, measures, start_time, end_time):
         reactor = self._printer.get_reactor()
         self._validate_samples_time(measures, start_time, end_time)
         # Correlate measurements to toolhead position at time of measurement
@@ -721,10 +723,10 @@ class EddyTap:
         z_contact, freq_contact, depress_slope, slope, slope2 = coeffs
         reactor.pause(0.)
         sps = self._sensor_helper.get_samples_per_second()
-        contact_slope_delta_per_sample = (depress_slope - slope) * speed / sps
-        if contact_slope_delta_per_sample < self._current_tap_threshold:
+        contact_slope_delta = depress_slope - slope
+        if contact_slope_delta < self._current_tap_threshold:
             self._error_detect("insufficient slope delta (%.6f vs %.6f)"
-                               % (contact_slope_delta_per_sample,
+                               % (contact_slope_delta,
                                   self._current_tap_threshold))
         if slope >= 0. or slope2 < 0.:
             self._error_detect("invalid free air slope (s=%.6f s2=%.6f)"
@@ -765,7 +767,7 @@ class EddyTap:
         start_time = retract_start_time - 0.010
         end_time = retract_start_time + 0.150
         self._gather.add_probe_request(self._analyze_pullback, start_time,
-                                       end_time, start_time, end_time, speed)
+                                       end_time, start_time, end_time)
     def pull_probed_results(self):
         return self._gather.pull_probed()
     def end_probe_session(self):

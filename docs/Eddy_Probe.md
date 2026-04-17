@@ -98,86 +98,102 @@ gcode:
 
 ## Tap calibration
 
-The Eddy probe measures the resonance frequency of the coil.
-By the absolute value of the frequency and the calibration curve from
-`PROBE_EDDY_CURRENT_CALIBRATE`, it is therefore possible to detect
-where the bed is without physical contact.
+Eddy current probes support a special kind of probing referred to as
+"tap" probing. This mechanism directs the toolhead to descend until
+the nozzle makes contact with the bed. That bed contact may cause a
+change in sensor measurements which can be detected and used to halt
+further downward movement. The nozzle is then lifted away from the bed
+and the sensor results from the lifting movement are analyzed to
+determine the location where the nozzle breaks contact with the bed.
 
-By use of the same knowledge, we know that frequency changes with
-the distance. It is possible to track that change in real time and
-detect the time/position where contact happens - a change of frequency
-starts to change in a different way.
-For example, stopped to change because of the collision.
+In order to utilize "tap" probing it is necessary to configure a
+`tap_threshold` parameter. This parameter determines when downward
+toolhead movement during a "tap" probe should be halted. A value too
+large could result in a nozzle/bed contact not detected, which could
+result in the nozzle crashing uncontrollably into the bed. A value too
+small could result in a "tap" probe attempt halting before making
+contact with the bed, which could result in wildly inaccurate probe
+results.
 
-Because eddy output is not perfect: there is sensor noise,
-mechanical oscillation, thermal expansion and other discrepancies,
-it is required to calibrate the stop threshold for your machine.
-Practically, it ensures that the Eddy's output data absolute value
-change per second (velocity) is high enough - higher than the noise level,
-and that upon collision it always decreases by at least this value.
+The following process is recommended to select an appropriate
+`tap_threshold` value.
 
-The suggested calibration routine works as follows:
-1. Home Z
-2. Place the toolhead at the center of the bed.
-3. Move the Z axis far away (30 mm, for example).
-4. Run `PROBE METHOD=tap`
-5. If it stops before colliding, increase the `tap_threshold`.
+1. Enable the printer, home the printer, move the toolhead to a
+   position near the center of the bed, and make sure the nozzle is
+   between 3 - 10 millimeters from the bed.
 
-Repeat until the nozzle softly touches the bed.
-This is easier to do with a clean nozzle and
-by visually inspecting the process.
+2. Run the `PROBE_EDDY_CURRENT_TAP_ANALYZE` command. The output should
+   contain a line similar to:
+   `Calibration: f=3314735.082 s=-48.267 q=7.667`
+   Identify, the reported "calibration" `s` parameter, and calculate
+   an initial threshold value as `initial_threshold = -s / 10`. So,
+   for example, if the value for `s` was reported as `-48.267` then
+   one would have an initial value of `4.8267`. Be sure to use the
+   values from the output on your printer as each printer will have
+   different values.
 
-You can streamline the process by placing the toolhead in the center once.
-Then, upon config restart, trick the machine into thinking that Z is homed.
-```
-SET_KINEMATIC_POSITION X=<middle> Y=<middle> Z=0
-G0 Z5 # Optional retract
-PROBE METHOD=tap
-```
+3. The next step is to run a tap probe attempt with the
+   `initial_threshold` setting. Commanding the nozzle into the bed
+   always has some risks, so be prepared to issue an emergency halt
+   (`M112`) if the probing descent does not stop after contacting the
+   bed. When ready issue a tap probe attempt with a command like the
+   following:
+   `PROBE METHOD=tap TAP_THRESHOLD=<initial_threshold>`
+   Ideally the above command will cause the probe to descend until it
+   hits the bed, lift away from the bed, and then report a valid probe
+   result. If not, see the paragraphs at the end of this section to
+   troubleshoot tap results. If the attempt was successful then
+   continue to the next step.
 
-Here is an example sequence of threshold values to test:
-```
-50 -> 250 -> 500 -> 1000 -> 2000 -> 4000 -> 8000
-8000 -> 6000 -> 5000
-```
-Your value will normally be between those.
-- Too high a value leaves a less safe margin for early collision -
-if something is between the nozzle and the bed, or if the nozzle
-is too close to the bed before the tap.
-- Too low - can make the toolhead stop in mid-air
-because of the noise.
+4. If the initial tap succeeds then the next step is to calculate a
+   refined tap threshold. Run the following command:
+   `PROBE_EDDY_CURRENT_TAP_ANALYZE`
+   which should produce output with a line similar to:
+   `contact_slope_delta=11.468`
+   Calculate the refined threshold value as
+   `refined_threshold = contact_slope_delta / 5` . So, for example, if
+   the value for `contact_slope_delta` was reported as `11.468` then
+   one would have a refined threshold value of `2.2936`. Be sure to
+   use the values from the output on your printer as each printer will
+   have different values.
 
-You can estimate the initial threshold value by analyzing your own
-calibration routine output:
-```
-probe_eddy_current: noise 0.000642mm, MAD_Hz=11.314
-...
-z: 1.010 # noise 0.000400mm, MAD_Hz=14.000
-```
-The estimation will be:
-```
-MAD_Hz * 100
-11.314 * 100 = 113.14
-```
+5. The next step is to run a tap probe attempt with the
+   `refined_threshold` setting. Make sure that the nozzle is near the
+   center of the bed, that it is between 3 - 10mm above the bed, be
+   ready to issue an emergency halt, and then run the following
+   command:
+   `PROBE METHOD=tap TAP_THRESHOLD=<refined_threshold>`
+   Ideally the above command will also succeed; if not, see the
+   paragraphs at the end of this section to troubleshoot tap
+   results. If the attempt was successful then continue to the next
+   step.
 
-To further fine tune threshold, one can use `PROBE_ACCURACY METHOD=tap`.
-The range is expected to be about 0.02 mm,
-with the default probe speed of 5 mm/s.
-Elevated coil temperature may increase noise and may require additional tuning.
+6. If probing with the refined threshold is successful then the next
+   test is to verify that it is stable over multiple probe attempts.
+   Make sure that the nozzle is near the center of the bed, that it is
+   between 3 - 10mm above the bed, be ready to issue an emergency
+   halt, and then run the following command:
+   `PROBE METHOD=tap SAMPLES=5 TAP_THRESHOLD=<refined_threshold>`
+   Ideally the above command will also succeed; if not, see the
+   paragraphs at the end of this section to troubleshoot tap
+   results. If the attempt was successful then continue to the next
+   step.
 
-You can validate the tap precision by measuring the paper thickness
-from the initial calibration guide. It is expected to be ~0.1mm.
+7. If all of the above steps are successful then set the
+   `tap_threshold` parameter in the printer.cfg file to the "refined
+   threshold" found in the steps above. Calibration should now be
+   complete.
 
-Tap precision is limited by the sampling frequency and
-the speed of the descent.
-If you take 24 photos per second of the moving train, you can only estimate
-where the train was between photos.
+If any of the steps above did not succeed then it may be necessary to
+troubleshoot and manually determine an appropriate `tap_threshold`.
 
-It is possible to reduce the descending speed.
+In general, if a probe attempt halts before making contact with the
+bed, then this indicates that the provided `TAP_THRESHOLD` parameter
+is too low. Try increasing it by about 10% and retry.
 
-It is possible to tap over non-conductive surfaces as long as there is metal
-behind it within the sensor's sensitivity range.
-Max distance can be approximated to be about 1.5x of the coil's narrowest part.
+Similarly, if a probe attempt does not halt after making contact with
+the bed then it indicates that `TAP_THRESHOLD` is too high. Consider
+decreasing the attempted value in half.
 
 ## Thermal Drift Calibration
 

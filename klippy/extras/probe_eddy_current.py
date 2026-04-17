@@ -63,6 +63,8 @@ class EddyCalibration:
                 offset = prev_zpos - prev_freq * gain
                 zpos = adj_freq * gain + offset
             samples[i] = (samp_time, freq, round(zpos, 6))
+    def get_calibration(self):
+        return list(self.cal_freqs), list(self.cal_zpos)
     def freq_to_height(self, freq):
         dummy_sample = [(0., freq, 0.)]
         self.apply_calibration(dummy_sample)
@@ -496,9 +498,11 @@ class EddyEndstopWrapper:
 
 # Probing helper for "tap" requests
 class EddyTap:
-    def __init__(self, config, sensor_helper, param_helper, trigger_analog):
+    def __init__(self, config, sensor_helper, calibration,
+                 param_helper, trigger_analog):
         self._printer = config.get_printer()
         self._sensor_helper = sensor_helper
+        self._calibration = calibration
         self._param_helper = param_helper
         self._trigger_analog = trigger_analog
         self._z_min_position = probe.lookup_minimum_z(config)
@@ -509,6 +513,12 @@ class EddyTap:
         self._least_squares_cache = {}
         self._current_tap_threshold = 0.
         self._setup_tap()
+        # PROBE_EDDY_CURRENT_TAP_ANALYZE
+        self._last_tap = None
+        gcode = self._printer.lookup_object("gcode")
+        gcode.register_command("PROBE_EDDY_CURRENT_TAP_ANALYZE",
+                               self.cmd_TAP_ANALYZE,
+                               desc=self.cmd_TAP_ANALYZE_help)
     # Setup for "tap" probe request
     def _setup_tap(self):
         # Create sos filter "design"
@@ -706,6 +716,7 @@ class EddyTap:
     def _error_detect(self, msg):
         raise self._printer.command_error("Unable to detect tap: %s" % (msg,))
     def _analyze_pullback(self, measures, start_time, end_time):
+        self._last_tap = None
         reactor = self._printer.get_reactor()
         self._validate_samples_time(measures, start_time, end_time)
         # Correlate measurements to toolhead position at time of measurement
@@ -720,6 +731,7 @@ class EddyTap:
         # Find best fit for extracted measurements
         coeffs = self._find_least_squares(data)
         z_contact, freq_contact, depress_slope, slope, slope2 = coeffs
+        self._last_tap = ("fail", z_contact - min_z, coeffs)
         reactor.pause(0.)
         sps = self._sensor_helper.get_samples_per_second()
         contact_slope_delta = depress_slope - slope
@@ -733,6 +745,7 @@ class EddyTap:
         if z_contact - min_z < 0.030 or z_contact - min_z > 0.250:
             self._error_detect("invalid depress distance (%.6f vs %.6f:%.6f)"
                                % (z_contact - min_z, 0.030, 0.250))
+        self._last_tap = ("success", z_contact - min_z, coeffs)
         # Report probe position
         trig_idx = len(data)-1
         while trig_idx > 0 and data[trig_idx-1][1][2] > z_contact:
@@ -772,6 +785,43 @@ class EddyTap:
     def end_probe_session(self):
         self._gather.finish()
         self._gather = None
+    # PROBE_EDDY_CURRENT_TAP_ANALYZE
+    def _analyze_calibrate(self):
+        freqs, zpos = self._calibration.get_calibration()
+        if len(freqs) < 2:
+            return ["No calibration data available", ""]
+        # Find best fit for: freq = c0 + c1*z + c2*z*z
+        eqs = []
+        ans = []
+        for freq, z in zip(freqs, zpos):
+            if z <= 0.750:
+                ans.append([freq])
+                eqs.append([1., z, z*z])
+        eqst = mathutil.mat_transp(eqs)
+        eqst_eqs = mathutil.mat_mat_mul(eqst, eqs)
+        eqst_ans = mathutil.mat_mat_mul(eqst, ans)
+        coeffs = mathutil.gaussian_solve(eqst_eqs, eqst_ans)
+        msg = ("Calibration: f=%.3f s=%.3f q=%.3f"
+               % (coeffs[0][0], coeffs[1][0], coeffs[2][0]))
+        return [msg, ""]
+    cmd_TAP_ANALYZE_help = "Calibration information for 'tap' probing"
+    def cmd_TAP_ANALYZE(self, gcmd):
+        msgs = self._analyze_calibrate()
+        if self._last_tap is None:
+            msgs.append("Run tap probe for last tap analysis.")
+        else:
+            status, depress_dist, coeffs = self._last_tap
+            z_contact, freq_contact, depress_slope, slope, slope2 = coeffs
+            contact_slope_delta = depress_slope - slope
+            m1 = ("Last tap: z=%.6f f=%.3f s=%.3f q=%.3f"
+                  % (z_contact, freq_contact, slope, slope2))
+            m2 = ("  depress_dist=%.6f depress_slope=%.3f"
+                  % (depress_dist, depress_slope))
+            m3 = ("  contact_slope_delta=%.3f" % (contact_slope_delta,))
+            msgs.extend([m1, m2, m3])
+            if status != "success":
+                msgs.extend(["", "Warning! Last tap did not succeed."])
+        gcmd.respond_info('\n'.join(msgs))
 
 # Implementing probing with "METHOD=scan"
 class EddyScanningProbe:
@@ -892,7 +942,7 @@ class PrinterEddyProbe:
         probe.HomingViaProbeHelper(config, mcu_probe,
                                    self.probe_offsets, self.param_helper)
         # Probing via "tap" interface
-        self.eddy_tap = EddyTap(config, self.sensor_helper,
+        self.eddy_tap = EddyTap(config, self.sensor_helper, self.calibration,
                                 self.param_helper, trig_analog)
         # Probing via "scan" and "rapid_scan" requests
         self.eddy_scan = EddyScanningProbe(config, self.sensor_helper,

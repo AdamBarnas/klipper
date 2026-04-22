@@ -140,6 +140,7 @@ class AngleCalibration:
         self.tmc_module = self.lookup_tmc()
         fmove = self.printer.lookup_object('force_move')
         self.mcu_stepper = fmove.lookup_stepper(self.stepper_name)
+        self.angle = self.printer.lookup_object(self.name)
     def get_microsteps(self):
         configfile = self.printer.lookup_object('configfile')
         sconfig = configfile.get_status(None)['settings']
@@ -154,7 +155,10 @@ class AngleCalibration:
                                              % (self.stepper_name,))
         mcu_pos = self.mcu_stepper.get_mcu_position()
         return (mcu_pos + mcu_phase_offset) % phases
-    def do_calibration_moves(self):
+    def do_calibration_moves(self, gcmd=None):
+        if gcmd:
+            gcmd.respond_info("CALIBRATION START: do_calibration_moves() called")
+        logging.info("CALIBRATION START: do_calibration_moves() called")
         move = self.printer.lookup_object('force_move').manual_move
         # Start data collection
         msgs = []
@@ -162,18 +166,35 @@ class AngleCalibration:
         def handle_batch(msg):
             if is_finished:
                 return False
+            batch_size = len(msg['data'])
+            logging.info("HANDLE_BATCH: received %d data points", batch_size)
+            if gcmd:
+                gcmd.respond_info("Batch: %d samples" % batch_size)
+                if batch_size > 0:
+                    for i, (query_time, pos) in enumerate(msg['data'][:5]):  # Show first 5
+                        gcmd.respond_info("  Sample %d: time=%.6f angle=0x%04x (%d)" % (i, query_time, pos & 0xffff, pos & 0xffff))
+                    if batch_size > 5:
+                        gcmd.respond_info("  ... and %d more samples" % (batch_size - 5))
+                else:
+                    gcmd.respond_info("  WARNING: Empty batch received!")
             msgs.append(msg)
+            logging.info("HANDLE_BATCH: Added message, total messages now: %d", len(msgs))
             return True
-        self.printer.lookup_object(self.name).add_client(handle_batch)
-        # Move stepper several turns (to allow internal sensor calibration)
+        self.angle.add_client(handle_batch)
+        if gcmd:
+            gcmd.respond_info("Client registered, starting measurements...")
+        logging.info("Client registered, starting measurements...")
         microsteps, full_steps = self.get_microsteps()
         mcu_stepper = self.mcu_stepper
         step_dist = mcu_stepper.get_step_dist()
         full_step_dist = step_dist * microsteps
         rotation_dist = full_steps * full_step_dist
         align_dist = step_dist * self.get_stepper_phase()
-        move_time = 0.010
+        move_time = 0.01
         move_speed = full_step_dist / move_time
+        self.angle._start_measurements()
+        toolhead = self.printer.lookup_object('toolhead')
+        toolhead.dwell(1.0)
         move(mcu_stepper, -(rotation_dist+align_dist), move_speed)
         move(mcu_stepper, 2. * rotation_dist, move_speed)
         move(mcu_stepper, -2. * rotation_dist, move_speed)
@@ -188,6 +209,17 @@ class AngleCalibration:
             end_query_time = start_query_time + 0.050
             times.append((start_query_time, end_query_time))
             toolhead.dwell(0.150)
+            # Manually process batches since reactor is blocked during moves
+            raw_samples = self.angle.bulk_queue.pull_queue()
+            if raw_samples:
+                logging.info("CALIBRATION MANUAL POLL: Got %d raw samples", len(raw_samples))
+                # Convert raw_samples to batch message format for handle_batch
+                samples, error_count = self.angle._extract_samples(raw_samples)
+                if samples:
+                    logging.info("CALIBRATION MANUAL POLL: Extracted %d samples", len(samples))
+                    # Call handle_batch with a message dict
+                    batch_msg = {'data': samples}
+                    handle_batch(batch_msg)
             if i == full_steps-1:
                 # Reverse direction and test each full step again
                 move(mcu_stepper, .5 * rotation_dist, move_speed)
@@ -195,8 +227,21 @@ class AngleCalibration:
                 samp_dist = -samp_dist
         move(mcu_stepper, .5*rotation_dist + align_dist, move_speed)
         toolhead.wait_moves()
+        # Final poll of any remaining samples before stopping
+        logging.info("CALIBRATION: Final sample poll after moves complete")
+        raw_samples = self.angle.bulk_queue.pull_queue()
+        if raw_samples:
+            logging.info("CALIBRATION FINAL POLL: Got %d raw samples", len(raw_samples))
+            samples, error_count = self.angle._extract_samples(raw_samples)
+            if samples:
+                logging.info("CALIBRATION FINAL POLL: Extracted %d samples", len(samples))
+                batch_msg = {'data': samples}
+                handle_batch(batch_msg)
+        # Stop measurements
+        self.angle._finish_measurements()
         # Finish data collection
         is_finished = True
+        logging.info("Collected %d messages during calibration", len(msgs))
         # Correlate query responses
         cal = {}
         step = 0
@@ -208,8 +253,9 @@ class AngleCalibration:
                 if step < len(times) and query_time >= times[step][0]:
                     cal.setdefault(step, []).append(pos)
         if len(cal) != len(times):
+            logging.error("Calibration: cal has %d entries, times has %d", len(cal), len(times))
             raise self.printer.command_error(
-                "Failed calibration - incomplete sensor data")
+                f'Failed calibration - incomplete sensor data ({len(cal)}/{len(times)})')
         fcal = { i: cal[i] for i in range(full_steps) }
         rcal = { full_steps-i-1: cal[i+full_steps] for i in range(full_steps) }
         return fcal, rcal
@@ -229,7 +275,7 @@ class AngleCalibration:
         old_calibration = self.calibration
         self.calibration = []
         try:
-            fcal, rcal = self.do_calibration_moves()
+            fcal, rcal = self.do_calibration_moves(gcmd)
         finally:
             self.calibration = old_calibration
         # Calculate each step position average and variance
@@ -600,11 +646,123 @@ class HelperMT6826S:
             val = self._read_reg(reg)
             gcmd.respond_info("REG[0x%04x] = 0x%02x" % (reg, val))
 
+class HelperMT6835:
+    SPI_MODE = 3
+    SPI_SPEED = 1000000
+    def __init__(self, config, spi, oid):
+        self.printer = config.get_printer()
+        self.spi = spi
+        self.oid = oid
+        self.mcu = self.spi.get_mcu()
+        self.mcu.register_config_callback(self._build_config)
+        self.is_tcode_absolute = False
+        self.last_temperature = None
+        name = config.get_name().split()[-1]
+        gcode = self.printer.lookup_object("gcode")
+        gcode.register_mux_command("ANGLE_DEBUG_READ", "CHIP", name,
+                                   self.cmd_ANGLE_DEBUG_READ,
+                                   desc=self.cmd_ANGLE_DEBUG_READ_help)
+    def _build_config(self):
+        # No additional MCU configuration required for MT6835 beyond SPI bus setup.
+        logging.info("MT6835: MCU config callback called")
+        return
+    def _send_spi(self, msg):
+        return self.spi.spi_transfer(msg)
+    def _read_reg(self, reg):
+        cmd = (0x03 << 12) | (reg & 0xfff)
+        msg = [(cmd >> 8) & 0xff, cmd & 0xff, 0]
+        params = self._send_spi(msg)
+        resp = bytearray(params['response'])
+        return resp[2]
+    def crc8(self, data, poly=0x07):
+        """Calculate CRC8 with configurable polynomial (default 0x07).
+        
+        MT6835 may use different polynomials:
+        - 0x07: Standard Klipper polynomial
+        - 0x31: Dallas/Maxim standard (alternative)
+        - 0x39: Another common variant
+        """
+        crc = 0x00
+        for byte in data:
+            crc ^= byte
+            for _ in range(8):
+                if crc & 0x80:
+                    crc = ((crc << 1) ^ poly) & 0xff
+                else:
+                    crc = (crc << 1) & 0xff
+        return crc
+    def _read_angle(self, reg=0x003):
+        angle_data = [self._read_reg(reg + i) for i in range(4)]
+        angle_raw = ((angle_data[0] << 13) | (angle_data[1] << 5)
+                     | (angle_data[2] >> 3))
+        status = angle_data[2] & 0x07
+        crc = angle_data[3]
+        crc_expected = self.crc8(angle_data[:3])
+        return angle_raw, status, crc, crc_expected, angle_data
+    def get_static_delay(self):
+        return .0001
+    def start(self):
+        # Initialize MT6835 sensor by reading angle once to ensure it responds
+        logging.info("MT6835: Initializing sensor with test read")
+        try:
+            for attempt in range(3):
+                try:
+                    angle_raw, status, crc, crc_expected, angle_data = self._read_angle()
+                    logging.info("MT6835: Init read %d successful - angle_raw=0x%05x status=0x%02x",
+                                attempt + 1, angle_raw, status)
+                    break
+                except Exception as e:
+                    logging.warning("MT6835: Init read attempt %d failed: %s", attempt + 1, e)
+                    if attempt < 2:
+                        import time
+                        time.sleep(0.01)  # Brief delay before retry
+        except Exception as e:
+            logging.warning("MT6835: Init failed with exception: %s", e)
+    def test_crc_polynomials(self, angle_data):
+        """Test different CRC polynomials to find the correct one."""
+        crc_actual = angle_data[3]
+        polynomials = [0x07, 0x31, 0x39, 0x1d, 0xf7, 0xd5]
+        logging.info("MT6835: Testing CRC polynomials against actual CRC=0x%02x", crc_actual)
+        for poly in polynomials:
+            crc_calc = self.crc8(angle_data[:3], poly)
+            match = "MATCH" if crc_calc == crc_actual else ""
+            logging.info("  poly=0x%02x -> crc=0x%02x %s", poly, crc_calc, match)
+    cmd_ANGLE_DEBUG_READ_help = "Query low-level angle sensor register"
+    def cmd_ANGLE_DEBUG_READ(self, gcmd):
+        reg = gcmd.get("REG", minval=0, maxval=0xfff,
+                       parser=lambda x: int(x, 0))
+        if reg != 0x003:
+            val = self._read_reg(reg)
+            gcmd.respond_info("REG[0x%03x] = 0x%02x" % (reg, val))
+            return
+        angle_raw, status, crc, crc_expected, angle_data = self._read_angle(reg)
+        angle = angle_raw >> 7
+        gcmd.respond_info("REG[0x003] = 0x%02x" % angle_data[0])
+        gcmd.respond_info("REG[0x004] = 0x%02x" % angle_data[1])
+        gcmd.respond_info("REG[0x005] = 0x%02x" % angle_data[2])
+        gcmd.respond_info("REG[0x006] = 0x%02x" % angle_data[3])
+        gcmd.respond_info("Angle raw = 0x%05x" % angle_raw)
+        gcmd.respond_info("Angle = %d (~%.4f°)" %
+                          (angle, angle * 360. / (1 << 14)))
+        gcmd.respond_info("Status = 0x%02x" % status)
+        if status & 0x07:
+            gcmd.respond_info("Overspeed=%d WeakSignal=%d Undervoltage=%d" % (
+                              bool(status & 0x01),
+                              bool(status & 0x02),
+                              bool(status & 0x04)))
+        gcmd.respond_info("CRC recv=0x%02x calc=0x%02x" %
+                          (crc, crc_expected))
+        # Test different CRC polynomials to find which one is correct for MT6835
+        logging.info("MT6835: Testing CRC polynomials for bulk data format")
+        self.test_crc_polynomials(angle_data)
 
-BYTES_PER_SAMPLE = 3
+
+BYTES_PER_SAMPLE = 3  # Default: [tcode, angle_low, angle_high]
+# MT6835 includes CRC byte: [tcode, angle_low, angle_high, crc]
+BYTES_PER_SAMPLE_WITH_CRC = 4
 SAMPLES_PER_BLOCK = bulk_sensor.MAX_BULK_MSG_SIZE // BYTES_PER_SAMPLE
 
-SAMPLE_PERIOD = 0.000400
+SAMPLE_PERIOD = 0.001000
 BATCH_UPDATES = 0.100
 
 class Angle:
@@ -621,9 +779,14 @@ class Angle:
                     "as5047d": HelperAS5047D,
                     "tle5012b": HelperTLE5012B,
                     "mt6816": HelperMT6816,
-                    "mt6826s": HelperMT6826S }
+                    "mt6826s": HelperMT6826S,
+                    "mt6835": HelperMT6835 }
         sensor_type = config.getchoice('sensor_type', {s: s for s in sensors})
         sensor_class = sensors[sensor_type]
+        self.sensor_type = sensor_type  # Store sensor type for extraction
+        # MT6835 bulk data: 3-byte format [tcode, angle_lo, angle_hi] (CRC only in register reads)
+        self.has_crc = False  # Bulk data has no CRC, only register reads do
+        self.bytes_per_sample = BYTES_PER_SAMPLE
         self.spi = bus.MCU_SPI_from_config(config, sensor_class.SPI_MODE,
                                            default_speed=sensor_class.SPI_SPEED)
         self.mcu = mcu = self.spi.get_mcu()
@@ -678,17 +841,20 @@ class Angle:
         else:
             time_shift = self.time_shift
             static_delay = self.sensor_helper.get_static_delay()
+        # Bulk sample format: [tcode, angle_lo, angle_hi] (3 bytes, no CRC)
+        bytes_per_sample = self.bytes_per_sample
+        samples_per_block = bulk_sensor.MAX_BULK_MSG_SIZE // bytes_per_sample
         # Process every message in raw_samples
         count = error_count = 0
-        samples = [None] * (len(raw_samples) * SAMPLES_PER_BLOCK)
+        samples = [None] * (len(raw_samples) * samples_per_block)
         for params in raw_samples:
             seq_diff = (params['sequence'] - last_sequence) & 0xffff
             last_sequence += seq_diff
-            samp_count = last_sequence * SAMPLES_PER_BLOCK
+            samp_count = last_sequence * samples_per_block
             msg_mclock = start_clock + samp_count*sample_ticks
             d = bytearray(params['data'])
-            for i in range(len(d) // BYTES_PER_SAMPLE):
-                d_ta = d[i*BYTES_PER_SAMPLE:(i+1)*BYTES_PER_SAMPLE]
+            for i in range(len(d) // bytes_per_sample):
+                d_ta = d[i*bytes_per_sample:(i+1)*bytes_per_sample]
                 tcode = d_ta[0]
                 if tcode == TCODE_ERROR:
                     error_count += 1
@@ -719,7 +885,8 @@ class Angle:
     def _is_measuring(self):
         return self.start_clock != 0
     def _start_measurements(self):
-        logging.info("Starting angle '%s' measurements", self.name)
+        logging.info("ANGLE MEASUREMENT: Starting measurements for '%s'", self.name)
+        logging.info("ANGLE MEASUREMENT: sample_period=%.6f", self.sample_period)
         self.sensor_helper.start()
         # Start bulk reading
         self.bulk_queue.clear_queue()
@@ -729,21 +896,29 @@ class Angle:
         self.start_clock = reqclock = self.mcu.print_time_to_clock(print_time)
         rest_ticks = self.mcu.seconds_to_clock(self.sample_period)
         self.sample_ticks = rest_ticks
+        logging.info("ANGLE MEASUREMENT: Sending MCU command with oid=%d, rest_ticks=%d, time_shift=%d", 
+                     self.oid, rest_ticks, self.time_shift)
         self.query_spi_angle_cmd.send([self.oid, reqclock, rest_ticks,
                                        self.time_shift], reqclock=reqclock)
+        logging.info("ANGLE MEASUREMENT: MCU command sent")
     def _finish_measurements(self):
         # Halt bulk reading
+        logging.info("ANGLE MEASUREMENT: Stopping measurements")
         self.query_spi_angle_cmd.send_wait_ack([self.oid, 0, 0, 0])
         self.bulk_queue.clear_queue()
         self.sensor_helper.last_temperature = None
-        logging.info("Stopped angle '%s' measurements", self.name)
+        logging.info("ANGLE MEASUREMENT: Measurements stopped")
     def _process_batch(self, eventtime):
+        logging.info("ANGLE MEASUREMENT: _process_batch called, eventtime=%.6f", eventtime)
         if self.sensor_helper.is_tcode_absolute:
             self.sensor_helper.update_clock()
         raw_samples = self.bulk_queue.pull_queue()
+        logging.info("ANGLE MEASUREMENT: pull_queue returned %d raw samples", len(raw_samples) if raw_samples else 0)
         if not raw_samples:
+            logging.info("ANGLE MEASUREMENT: No raw samples, returning empty dict")
             return {}
         samples, error_count = self._extract_samples(raw_samples)
+        logging.info("ANGLE MEASUREMENT: Extracted %d samples, %d errors", len(samples) if samples else 0, error_count)
         if not samples:
             return {}
         offset = self.calibration.apply_calibration(samples)

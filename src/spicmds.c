@@ -88,9 +88,14 @@ spidev_transfer(struct spidev_s *spi, uint8_t receive_data
                 , uint8_t data_len, uint8_t *data)
 {
     uint_fast8_t flags = spi->flags;
-    if (!(flags & (SF_SOFTWARE|SF_HARDWARE)))
+    if (!(flags & (SF_SOFTWARE|SF_HARDWARE))) {
         // Not yet initialized
+        output("DEBUG: spidev_transfer called but SPI not initialized");
         return;
+    }
+
+    output("DEBUG: spidev_transfer START - data_len=%u receive_data=%u first_byte=0x%02x",
+           data_len, receive_data, data_len > 0 ? data[0] : 0);
 
     if (CONFIG_WANT_SOFTWARE_SPI && flags & SF_SOFTWARE)
         spi_software_prepare(spi->spi_software);
@@ -107,6 +112,9 @@ spidev_transfer(struct spidev_s *spi, uint8_t receive_data
 
     if (flags & SF_HAVE_PIN)
         gpio_out_write(spi->pin, !(flags & SF_CS_ACTIVE_HIGH));
+
+    output("DEBUG: spidev_transfer END - first_byte=0x%02x (after transfer)",
+           data_len > 0 ? data[0] : 0);
 }
 
 void

@@ -243,30 +243,20 @@ static void mt6835_query(struct spi_angle *sa, uint32_t stime)
         crc_calculated ^= crc_data[i];
         for (int bit = 0; bit < 8; bit++) {
             if (crc_calculated & 0x80)
-                crc_calculated = (crc_calculated << 1) ^ poly;
+                crc_calculated = ((crc_calculated << 1) ^ poly) & 0xff;
             else
-                crc_calculated <<= 1;
+                crc_calculated = (crc_calculated << 1) & 0xff;
         }
     }
     
     // Check status for errors
-    if (status & (MT6835_STATUS_OVERSPEED_MASK | MT6835_STATUS_WEAK_SIGNAL_MASK | MT6835_STATUS_UNDERVOLTAGE_MASK)) {
-        // Log which status bits are set for debugging
-        sendf("MT6835_STATUS_ERROR status=0x%02x overspeed=%u weak=%u undervolt=%u",
-              status,
-              (status & MT6835_STATUS_OVERSPEED_MASK) ? 1 : 0,
-              (status & MT6835_STATUS_WEAK_SIGNAL_MASK) ? 1 : 0,
-              (status & MT6835_STATUS_UNDERVOLTAGE_MASK) ? 1 : 0);
+    if (status & (MT6835_STATUS_OVERSPEED_MASK | MT6835_STATUS_WEAK_SIGNAL_MASK | MT6835_STATUS_UNDERVOLTAGE_MASK))
         angle_add_error(sa, SE_NO_ANGLE);
-    }
-    else if (crc_calculated != crc_received) {
-        sendf("MT6835_CRC_ERROR calc=0x%02x recv=0x%02x", crc_calculated, crc_received);
+    else if (crc_calculated != crc_received)
         angle_add_error(sa, SE_CRC);
-    }
-    else {
+    else
         // Convert 21-bit angle to 14-bit for Klipper
         angle_add_data(sa, stime, mtime2, angle_raw >> 7);
-    }
 }
 
 static uint8_t

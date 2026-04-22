@@ -62,15 +62,11 @@ static uint_fast8_t
 angle_event(struct timer *timer)
 {
     struct spi_angle *sa = container_of(timer, struct spi_angle, timer);
-    output("ANGLE_EVENT: Timer fired, current_time=%u, rest_ticks=%u", sa->timer.waketime, sa->rest_ticks);
     uint8_t flags = sa->flags;
-    if (sa->flags & SA_PENDING) {
-        output("ANGLE_EVENT: SA_PENDING already set, marking overflow!");
+    if (sa->flags & SA_PENDING)
         sa->overflow++;
-    } else {
-        output("ANGLE_EVENT: Setting SA_PENDING flag to trigger measurement");
+    else
         sa->flags = flags | SA_PENDING;
-    }
     sched_wake_task(&angle_wake);
     sa->timer.waketime += sa->rest_ticks;
     return SF_RESCHEDULE;
@@ -137,10 +133,8 @@ angle_add_data(struct spi_angle *sa, uint32_t stime, uint32_t mtime
 static void
 a1333_query(struct spi_angle *sa, uint32_t stime)
 {
-    output("ANGLE: a1333_query triggered");
     uint8_t msg[2] = { 0x32, 0x00 };
     uint32_t mtime1 = timer_read_time();
-    output("ANGLE: a1333 SPI transfer starting, msg=[0x%02x, 0x%02x]", msg[0], msg[1]);
     spidev_transfer(sa->spi, 1, sizeof(msg), msg);
     uint32_t mtime2 = timer_read_time();
     // Data is latched on first sclk edge of response
@@ -165,10 +159,8 @@ static int bit_parity(uint8_t *msg)
 static void
 as5047d_query(struct spi_angle *sa, uint32_t stime)
 {
-    output("ANGLE: as5047d_query triggered");
     uint8_t msg[2] = { 0x7F, 0xFE };
     uint32_t mtime1 = timer_read_time();
-    output("ANGLE: as5047d SPI transfer starting, msg=[0x%02x, 0x%02x]", msg[0], msg[1]);
     spidev_transfer(sa->spi, 0, sizeof(msg), msg);
     uint32_t mtime2 = timer_read_time();
     // Data is latched on CS pin rising after query request
@@ -190,10 +182,8 @@ as5047d_query(struct spi_angle *sa, uint32_t stime)
 
 static void mt6816_query(struct spi_angle *sa, uint32_t stime)
 {
-    output("ANGLE: mt6816_query triggered");
     uint8_t msg[3] = {0x83, 0x00, 0x00};
     uint32_t mtime1 = timer_read_time();
-    output("ANGLE: mt6816 SPI transfer starting, msg=[0x%02x, 0x%02x, 0x%02x]", msg[0], msg[1], msg[2]);
     spidev_transfer(sa->spi, 1, sizeof(msg), msg);
     uint32_t mtime2 = timer_read_time();
     // Data is latched on first sclk edge of response
@@ -212,7 +202,6 @@ static void mt6816_query(struct spi_angle *sa, uint32_t stime)
 
 static void mt6835_query(struct spi_angle *sa, uint32_t stime)
 {
-    output("ANGLE: mt6835_query triggered");
     // MT6835 SPI protocol: read 4 registers sequentially
     // Each read: send 16-bit command (0x03 + 12-bit addr) + 8-bit dummy, receive 8-bit data
     uint8_t angle_data[4];
@@ -227,7 +216,6 @@ static void mt6835_query(struct spi_angle *sa, uint32_t stime)
             tx_word & 0xFF,
             0x00  // Dummy byte
         };
-        output("ANGLE: mt6835 SPI transfer %d/4 starting, addr=0x%03x, msg=[0x%02x, 0x%02x, 0x%02x]", i+1, addr, msg[0], msg[1], msg[2]);
         spidev_transfer(sa->spi, 1, sizeof(msg), msg);
         angle_data[i] = msg[2];  // Data received in last byte
     }
@@ -283,10 +271,8 @@ crc8_mt(uint8_t crc, uint8_t data)
 
 static void mt6826s_query(struct spi_angle *sa, uint32_t stime)
 {
-    output("ANGLE: mt6826s_query triggered");
     uint8_t msg[6] = {0x30, 0x03, 0x00, 0x00, 0x00, 0x00};
     uint32_t mtime1 = timer_read_time();
-    output("ANGLE: mt6826s SPI transfer starting, msg=[0x%02x, 0x%02x, 0x%02x, 0x%02x, 0x%02x, 0x%02x]", msg[0], msg[1], msg[2], msg[3], msg[4], msg[5]);
     spidev_transfer(sa->spi, 1, sizeof(msg), msg);
     uint32_t mtime2 = timer_read_time();
     // Data is latched on first sclk edge of response
@@ -335,7 +321,6 @@ udelay(uint32_t usecs)
 static void
 tle5012b_query(struct spi_angle *sa, uint32_t stime)
 {
-    output("ANGLE: tle5012b_query triggered");
     struct gpio_out cs_pin = spidev_get_cs_pin(sa->spi);
     // Latch data (data is latched on rising CS of a NULL message)
     gpio_out_write(cs_pin, 0);
@@ -344,11 +329,9 @@ tle5012b_query(struct spi_angle *sa, uint32_t stime)
     gpio_out_write(cs_pin, 1);
     uint32_t mtime = timer_read_time();
     irq_enable();
-    output("ANGLE: tle5012b latch CS pulse completed");
 
     uint8_t msg[10] = { TLE_READ_LATCH, (TLE_REG_AVAL << 4) | 0x03 };
     uint8_t crc = 0x05; // 0x05 == crc8(crc8(0xff, msg[0]), msg[1])
-    output("ANGLE: tle5012b SPI transfer starting, msg=[0x%02x, 0x%02x]", msg[0], msg[1]);
     spidev_transfer(sa->spi, 1, sizeof(msg), msg);
     int i;
     for (i=2; i<8; i++)
@@ -371,25 +354,18 @@ command_query_spi_angle(uint32_t *args)
     uint8_t oid = args[0];
     struct spi_angle *sa = oid_lookup(oid, command_config_spi_angle);
 
-    output("ANGLE_CMD: query_spi_angle called - oid=%u, clock=%u, rest_ticks=%u, time_shift=%u",
-           oid, args[1], args[2], args[3]);
-
     sched_del_timer(&sa->timer);
     sa->flags = 0;
-    if (!args[2]) {
+    if (!args[2])
         // End measurements
-        output("ANGLE_CMD: Stopping measurements (rest_ticks=0)");
         return;
-    }
 
     // Start new measurements query
-    output("ANGLE_CMD: Starting new measurements with period=%u ticks", args[2]);
     sa->timer.waketime = args[1];
     sa->rest_ticks = args[2];
     sensor_bulk_reset(&sa->sb);
     sa->time_shift = args[3];
     sched_add_timer(&sa->timer);
-    output("ANGLE_CMD: Timer scheduled, first event at clock=%u", sa->timer.waketime);
 }
 DECL_COMMAND(command_query_spi_angle,
              "query_spi_angle oid=%c clock=%u rest_ticks=%u time_shift=%c");
@@ -435,14 +411,12 @@ spi_angle_task(void)
 {
     if (!sched_check_wake(&angle_wake))
         return;
-    output("ANGLE_TASK: Task woken, processing pending angle measurements");
     uint8_t oid;
     struct spi_angle *sa;
     foreach_oid(oid, sa, command_config_spi_angle) {
         uint_fast8_t flags = sa->flags;
         if (!(flags & SA_PENDING))
             continue;
-        output("ANGLE_TASK: Found pending measurement for oid=%u, SA_PENDING flag set", oid);
         irq_disable();
         uint32_t stime = sa->timer.waketime;
         uint_fast8_t overflow = sa->overflow;
@@ -451,12 +425,10 @@ spi_angle_task(void)
         irq_enable();
         stime -= sa->rest_ticks;
         while (overflow--) {
-            output("ANGLE_TASK: Processing overflow condition");
             angle_add_error(sa, SE_OVERFLOW);
             angle_check_report(sa, oid);
         }
         uint_fast8_t chip = sa->chip_type;
-        output("ANGLE_TASK: Dispatching query for chip_type=%u", chip);
         if (chip == SA_CHIP_A1333)
             a1333_query(sa, stime);
         else if (chip == SA_CHIP_AS5047D)
@@ -470,7 +442,6 @@ spi_angle_task(void)
         else if (chip == SA_CHIP_MT6835)
             mt6835_query(sa, stime);
         angle_check_report(sa, oid);
-        output("ANGLE_TASK: Query completed for oid=%u", oid);
     }
 }
 DECL_TASK(spi_angle_task);

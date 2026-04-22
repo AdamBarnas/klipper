@@ -212,7 +212,10 @@ crc8_mt(uint8_t crc, uint8_t data)
 
 static void mt6835_query(struct spi_angle *sa, uint32_t stime)
 {
-    // Burst read: cmd 0xA + 12-bit start addr 0x003, then 4 data bytes
+    // Single burst read (cmd 0xA, addr 0x003, 4 data bytes) keeps the
+    // total SPI time under MAX_SPI_READ_TIME. Four separate transactions
+    // exceed the 50 us budget on STM32F103 @ 72 MHz due to CS toggling
+    // and per-transfer scheduling overhead.
     uint8_t msg[6] = { 0xA0, 0x03, 0x00, 0x00, 0x00, 0x00 };
     uint32_t mtime1 = timer_read_time();
     spidev_transfer(sa->spi, 1, sizeof(msg), msg);

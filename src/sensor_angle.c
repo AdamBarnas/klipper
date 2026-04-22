@@ -200,65 +200,6 @@ static void mt6816_query(struct spi_angle *sa, uint32_t stime)
         angle_add_data(sa, stime, mtime2, (msg[1] << 8) | (msg[2] & 0xfc));
 }
 
-static void mt6835_query(struct spi_angle *sa, uint32_t stime)
-{
-    // MT6835 SPI protocol: read 4 registers sequentially
-    // Each read: send 16-bit command (0x03 + 12-bit addr) + 8-bit dummy, receive 8-bit data
-    uint8_t angle_data[4];
-    uint32_t mtime1 = timer_read_time();
-    
-    // Read angle registers 0x003 to 0x006
-    for (int i = 0; i < 4; i++) {
-        uint16_t addr = 0x003 + i;
-        uint16_t tx_word = (0x03 << 12) | (addr & 0xFFF);  // 4-bit read cmd + 12-bit addr
-        uint8_t msg[3] = {
-            (tx_word >> 8) & 0xFF,
-            tx_word & 0xFF,
-            0x00  // Dummy byte
-        };
-        spidev_transfer(sa->spi, 1, sizeof(msg), msg);
-        angle_data[i] = msg[2];  // Data received in last byte
-    }
-    
-    uint32_t mtime2 = timer_read_time();
-    // Data is latched on first sclk edge of response
-    if (mtime2 - mtime1 > MAX_SPI_READ_TIME) {
-        angle_add_error(sa, SE_SPI_TIME);
-        return;
-    }
-    
-    // Assemble data as per MT6835 protocol
-    uint32_t raw = ((uint32_t)angle_data[0] << 24) | ((uint32_t)angle_data[1] << 16) | 
-                   ((uint32_t)angle_data[2] << 8) | angle_data[3];
-    uint32_t angle_raw = ((uint32_t)angle_data[0] << 13) | ((uint32_t)angle_data[1] << 5) | 
-                         ((uint32_t)angle_data[2] >> 3);  // 21-bit angle
-    uint8_t status = angle_data[2] & 0x07;  // Status in bits 2:0 of third byte
-    uint8_t crc_received = angle_data[3];
-    
-    // Calculate CRC-8 on 24-bit data: angle[20:0] + status[2:0]
-    uint8_t crc_data[3] = {angle_data[0], angle_data[1], angle_data[2]};
-    uint8_t crc_calculated = 0x00;
-    uint8_t poly = 0x07;  // x^8 + x^2 + x + 1
-    for (int i = 0; i < 3; i++) {
-        crc_calculated ^= crc_data[i];
-        for (int bit = 0; bit < 8; bit++) {
-            if (crc_calculated & 0x80)
-                crc_calculated = ((crc_calculated << 1) ^ poly) & 0xff;
-            else
-                crc_calculated = (crc_calculated << 1) & 0xff;
-        }
-    }
-    
-    // Check status for errors
-    if (status & (MT6835_STATUS_OVERSPEED_MASK | MT6835_STATUS_WEAK_SIGNAL_MASK | MT6835_STATUS_UNDERVOLTAGE_MASK))
-        angle_add_error(sa, SE_NO_ANGLE);
-    else if (crc_calculated != crc_received)
-        angle_add_error(sa, SE_CRC);
-    else
-        // Convert 21-bit angle to 14-bit for Klipper
-        angle_add_data(sa, stime, mtime2, angle_raw >> 7);
-}
-
 static uint8_t
 crc8_mt(uint8_t crc, uint8_t data)
 {
@@ -267,6 +208,38 @@ crc8_mt(uint8_t crc, uint8_t data)
     for (i = 0; i < 8; i++)
         crc = crc & 0x80 ? (crc << 1) ^ 0x07 : crc << 1;
     return crc;
+}
+
+static void mt6835_query(struct spi_angle *sa, uint32_t stime)
+{
+    // Burst read: cmd 0xA + 12-bit start addr 0x003, then 4 data bytes
+    uint8_t msg[6] = { 0xA0, 0x03, 0x00, 0x00, 0x00, 0x00 };
+    uint32_t mtime1 = timer_read_time();
+    spidev_transfer(sa->spi, 1, sizeof(msg), msg);
+    uint32_t mtime2 = timer_read_time();
+    if (mtime2 - mtime1 > MAX_SPI_READ_TIME) {
+        angle_add_error(sa, SE_SPI_TIME);
+        return;
+    }
+    uint32_t angle_raw = ((uint32_t)msg[2] << 13)
+                       | ((uint32_t)msg[3] << 5)
+                       | ((uint32_t)msg[4] >> 3);
+    uint8_t status       = msg[4] & 0x07;
+    uint8_t crc_received = msg[5];
+
+    uint8_t crc = 0;
+    crc = crc8_mt(crc, msg[2]);
+    crc = crc8_mt(crc, msg[3]);
+    crc = crc8_mt(crc, msg[4]);
+
+    if (status & (MT6835_STATUS_OVERSPEED_MASK
+                | MT6835_STATUS_WEAK_SIGNAL_MASK
+                | MT6835_STATUS_UNDERVOLTAGE_MASK))
+        angle_add_error(sa, SE_NO_ANGLE);
+    else if (crc != crc_received)
+        angle_add_error(sa, SE_CRC);
+    else
+        angle_add_data(sa, stime, mtime2, angle_raw >> 7);
 }
 
 static void mt6826s_query(struct spi_angle *sa, uint32_t stime)

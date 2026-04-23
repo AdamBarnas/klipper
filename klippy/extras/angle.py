@@ -155,10 +155,7 @@ class AngleCalibration:
                                              % (self.stepper_name,))
         mcu_pos = self.mcu_stepper.get_mcu_position()
         return (mcu_pos + mcu_phase_offset) % phases
-    def do_calibration_moves(self, gcmd=None):
-        if gcmd:
-            gcmd.respond_info("CALIBRATION START: do_calibration_moves() called")
-        logging.info("CALIBRATION START: do_calibration_moves() called")
+    def do_calibration_moves(self):
         move = self.printer.lookup_object('force_move').manual_move
         # Start data collection
         msgs = []
@@ -166,24 +163,9 @@ class AngleCalibration:
         def handle_batch(msg):
             if is_finished:
                 return False
-            batch_size = len(msg['data'])
-            logging.info("HANDLE_BATCH: received %d data points", batch_size)
-            if gcmd:
-                gcmd.respond_info("Batch: %d samples" % batch_size)
-                if batch_size > 0:
-                    for i, (query_time, pos) in enumerate(msg['data'][:5]):  # Show first 5
-                        gcmd.respond_info("  Sample %d: time=%.6f angle=0x%04x (%d)" % (i, query_time, pos & 0xffff, pos & 0xffff))
-                    if batch_size > 5:
-                        gcmd.respond_info("  ... and %d more samples" % (batch_size - 5))
-                else:
-                    gcmd.respond_info("  WARNING: Empty batch received!")
             msgs.append(msg)
-            logging.info("HANDLE_BATCH: Added message, total messages now: %d", len(msgs))
             return True
         self.angle.add_client(handle_batch)
-        if gcmd:
-            gcmd.respond_info("Client registered, starting measurements...")
-        logging.info("Client registered, starting measurements...")
         microsteps, full_steps = self.get_microsteps()
         mcu_stepper = self.mcu_stepper
         step_dist = mcu_stepper.get_step_dist()
@@ -275,7 +257,7 @@ class AngleCalibration:
         old_calibration = self.calibration
         self.calibration = []
         try:
-            fcal, rcal = self.do_calibration_moves(gcmd)
+            fcal, rcal = self.do_calibration_moves()
         finally:
             self.calibration = old_calibration
         # Calculate each step position average and variance

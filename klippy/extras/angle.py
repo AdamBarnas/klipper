@@ -644,6 +644,9 @@ class HelperMT6835:
         gcode.register_mux_command("ANGLE_DEBUG_READ", "CHIP", name,
                                    self.cmd_ANGLE_DEBUG_READ,
                                    desc=self.cmd_ANGLE_DEBUG_READ_help)
+        gcode.register_mux_command("ANGLE_SPI_TEST", "CHIP", name,
+                                   self.cmd_ANGLE_SPI_TEST,
+                                   desc=self.cmd_ANGLE_SPI_TEST_help)
     def _build_config(self):
         # No additional MCU configuration required for MT6835 beyond SPI bus setup.
         logging.info("MT6835: MCU config callback called")
@@ -709,6 +712,67 @@ class HelperMT6835:
             crc_calc = self.crc8(angle_data[:3], poly)
             match = "MATCH" if crc_calc == crc_actual else ""
             logging.info("  poly=0x%02x -> crc=0x%02x %s", poly, crc_calc, match)
+    def _read_angle_burst(self):
+        # Matches C firmware mt6835_query: cmd 0xA (burst read), addr 0x003, 4 data bytes
+        msg = [0xA0, 0x03, 0x00, 0x00, 0x00, 0x00]
+        params = self._send_spi(msg)
+        resp = bytearray(params['response'])
+        d = resp[2:6]
+        angle_raw = ((d[0] << 13) | (d[1] << 5) | (d[2] >> 3))
+        status = d[2] & 0x07
+        crc_received = d[3]
+        crc_expected = self.crc8([d[0], d[1], d[2]])
+        return angle_raw, status, crc_received, crc_expected
+    cmd_ANGLE_SPI_TEST_help = "Test MT6835 SPI communication reliability"
+    def cmd_ANGLE_SPI_TEST(self, gcmd):
+        import math, time
+        count = gcmd.get_int('COUNT', 200, minval=10, maxval=2000)
+        gcmd.respond_info("MT6835 SPI reliability test: %d reads per method..." % count)
+        def run_test(read_fn):
+            ok = crc_err = status_err = 0
+            angles = []
+            for _ in range(count):
+                try:
+                    result = read_fn()
+                    angle_raw, status, crc_r, crc_e = result[:4]
+                    if status & 0x07:
+                        status_err += 1
+                    elif crc_r != crc_e:
+                        crc_err += 1
+                    else:
+                        ok += 1
+                        angles.append(angle_raw >> 7)
+                except Exception:
+                    crc_err += 1
+                time.sleep(0.001)
+            total = ok + crc_err + status_err
+            pct = 100. * ok / total if total else 0.
+            line = "%d/%d ok (%.1f%%), %d CRC errors, %d status errors" % (
+                ok, total, pct, crc_err, status_err)
+            if angles:
+                mean = sum(angles) / len(angles)
+                stddev = math.sqrt(sum((a - mean)**2 for a in angles) / len(angles))
+                line += "\n  Angle jitter: stddev=%.2f counts (~%.4f deg)" % (
+                    stddev, stddev * 360. / (1 << 14))
+            return line, ok, total
+        burst_line, burst_ok, burst_total = run_test(self._read_angle_burst)
+        seq_line, seq_ok, seq_total = run_test(self._read_angle)
+        lines = [
+            "Burst read (matches firmware): " + burst_line,
+            "Sequential (4 reads):          " + seq_line,
+        ]
+        if burst_total and seq_total:
+            burst_rate = burst_ok / burst_total
+            seq_rate = seq_ok / seq_total
+            if burst_rate >= seq_rate:
+                lines.append("=> Burst read is equally or more reliable")
+            else:
+                lines.append("=> Sequential reads are more reliable")
+            if min(burst_rate, seq_rate) < 0.90:
+                lines.append("=> High error rate - check wiring or reduce spi_speed in config")
+            elif min(burst_rate, seq_rate) >= 0.99:
+                lines.append("=> Communication looks healthy")
+        gcmd.respond_info('\n'.join(lines))
     cmd_ANGLE_DEBUG_READ_help = "Query low-level angle sensor register"
     def cmd_ANGLE_DEBUG_READ(self, gcmd):
         reg = gcmd.get("REG", minval=0, maxval=0xfff,

@@ -35,7 +35,7 @@ enum {
     SE_OVERFLOW, SE_SCHEDULE, SE_SPI_TIME, SE_CRC, SE_DUP, SE_NO_ANGLE
 };
 
-#define MAX_SPI_READ_TIME timer_from_us(50)
+#define MAX_SPI_READ_TIME timer_from_us(80)
 
 #define MT6835_STATUS_OVERSPEED_MASK    0x01
 #define MT6835_STATUS_WEAK_SIGNAL_MASK  0x02

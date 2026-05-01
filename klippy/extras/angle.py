@@ -172,17 +172,15 @@ class AngleCalibration:
         full_step_dist = step_dist * microsteps
         rotation_dist = full_steps * full_step_dist
         align_dist = step_dist * self.get_stepper_phase()
-        move_time = 0.01
+        move_time = 0.010
         move_speed = full_step_dist / move_time
-        self.angle._start_measurements()
         toolhead = self.printer.lookup_object('toolhead')
-        toolhead.dwell(1.0)
+        toolhead.dwell(0.500)
         move(mcu_stepper, -(rotation_dist+align_dist), move_speed)
         move(mcu_stepper, 2. * rotation_dist, move_speed)
         move(mcu_stepper, -2. * rotation_dist, move_speed)
         move(mcu_stepper, .5 * rotation_dist - full_step_dist, move_speed)
         # Move to each full step position
-        toolhead = self.printer.lookup_object('toolhead')
         times = []
         samp_dist = full_step_dist
         for i in range(2 * full_steps):
@@ -191,17 +189,6 @@ class AngleCalibration:
             end_query_time = start_query_time + 0.050
             times.append((start_query_time, end_query_time))
             toolhead.dwell(0.150)
-            # Manually process batches since reactor is blocked during moves
-            raw_samples = self.angle.bulk_queue.pull_queue()
-            if raw_samples:
-                logging.info("CALIBRATION MANUAL POLL: Got %d raw samples", len(raw_samples))
-                # Convert raw_samples to batch message format for handle_batch
-                samples, error_count = self.angle._extract_samples(raw_samples)
-                if samples:
-                    logging.info("CALIBRATION MANUAL POLL: Extracted %d samples", len(samples))
-                    # Call handle_batch with a message dict
-                    batch_msg = {'data': samples}
-                    handle_batch(batch_msg)
             if i == full_steps-1:
                 # Reverse direction and test each full step again
                 move(mcu_stepper, .5 * rotation_dist, move_speed)
@@ -209,21 +196,8 @@ class AngleCalibration:
                 samp_dist = -samp_dist
         move(mcu_stepper, .5*rotation_dist + align_dist, move_speed)
         toolhead.wait_moves()
-        # Final poll of any remaining samples before stopping
-        logging.info("CALIBRATION: Final sample poll after moves complete")
-        raw_samples = self.angle.bulk_queue.pull_queue()
-        if raw_samples:
-            logging.info("CALIBRATION FINAL POLL: Got %d raw samples", len(raw_samples))
-            samples, error_count = self.angle._extract_samples(raw_samples)
-            if samples:
-                logging.info("CALIBRATION FINAL POLL: Extracted %d samples", len(samples))
-                batch_msg = {'data': samples}
-                handle_batch(batch_msg)
-        # Stop measurements
-        self.angle._finish_measurements()
         # Finish data collection
         is_finished = True
-        logging.info("Collected %d messages during calibration", len(msgs))
         # Correlate query responses
         cal = {}
         step = 0
@@ -949,22 +923,16 @@ class Angle:
         logging.info("ANGLE MEASUREMENT: MCU command sent")
     def _finish_measurements(self):
         # Halt bulk reading
-        logging.info("ANGLE MEASUREMENT: Stopping measurements")
         self.query_spi_angle_cmd.send_wait_ack([self.oid, 0, 0, 0])
         self.bulk_queue.clear_queue()
         self.sensor_helper.last_temperature = None
-        logging.info("ANGLE MEASUREMENT: Measurements stopped")
     def _process_batch(self, eventtime):
-        logging.info("ANGLE MEASUREMENT: _process_batch called, eventtime=%.6f", eventtime)
         if self.sensor_helper.is_tcode_absolute:
             self.sensor_helper.update_clock()
         raw_samples = self.bulk_queue.pull_queue()
-        logging.info("ANGLE MEASUREMENT: pull_queue returned %d raw samples", len(raw_samples) if raw_samples else 0)
         if not raw_samples:
-            logging.info("ANGLE MEASUREMENT: No raw samples, returning empty dict")
             return {}
         samples, error_count = self._extract_samples(raw_samples)
-        logging.info("ANGLE MEASUREMENT: Extracted %d samples, %d errors", len(samples) if samples else 0, error_count)
         if not samples:
             return {}
         offset = self.calibration.apply_calibration(samples)

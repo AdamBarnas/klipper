@@ -186,9 +186,9 @@ class AngleCalibration:
         for i in range(2 * full_steps):
             move(mcu_stepper, samp_dist, move_speed)
             start_query_time = toolhead.get_last_move_time() + 0.050
-            end_query_time = start_query_time + 0.050
+            end_query_time = start_query_time + 0.150
             times.append((start_query_time, end_query_time))
-            toolhead.dwell(0.150)
+            toolhead.dwell(0.250)
             if i == full_steps-1:
                 # Reverse direction and test each full step again
                 move(mcu_stepper, .5 * rotation_dist, move_speed)
@@ -215,16 +215,31 @@ class AngleCalibration:
         fcal = { i: cal[i] for i in range(full_steps) }
         rcal = { full_steps-i-1: cal[i+full_steps] for i in range(full_steps) }
         return fcal, rcal
-    def calc_angles(self, meas):
-        total_count = total_variance = 0
+    def calc_angles(self, meas, sigma_reject=3.0):
+        total_count = total_variance = total_rejected = 0
         angles = {}
         for step, data in meas.items():
+            # First pass: compute mean and std for outlier rejection
             count = len(data)
-            angle_avg = float(sum(data)) / count
+            mean = float(sum(data)) / count
+            if count > 2:
+                std = math.sqrt(sum((d - mean)**2 for d in data) / count)
+                if std > 0.:
+                    threshold = sigma_reject * std
+                    filtered = [d for d in data if abs(d - mean) <= threshold]
+                else:
+                    filtered = data
+            else:
+                filtered = data
+            total_rejected += count - len(filtered)
+            # Second pass: average on filtered data
+            fcount = len(filtered)
+            angle_avg = float(sum(filtered)) / fcount
             angles[step] = angle_avg
-            total_count += count
-            total_variance += sum([(d - angle_avg)**2 for d in data])
-        return angles, math.sqrt(total_variance / total_count), total_count
+            total_count += fcount
+            total_variance += sum((d - angle_avg)**2 for d in filtered)
+        stddev = math.sqrt(total_variance / total_count) if total_count else 0.
+        return angles, stddev, total_count, total_rejected
     cmd_ANGLE_CALIBRATE_help = "Calibrate angle sensor to stepper motor"
     def cmd_ANGLE_CALIBRATE(self, gcmd):
         # Perform calibration movement and capture
@@ -236,16 +251,18 @@ class AngleCalibration:
             self.calibration = old_calibration
         # Calculate each step position average and variance
         microsteps, full_steps = self.get_microsteps()
-        fangles, fstd, ftotal = self.calc_angles(fcal)
-        rangles, rstd, rtotal = self.calc_angles(rcal)
+        fangles, fstd, ftotal, _ = self.calc_angles(fcal)
+        rangles, rstd, rtotal, _ = self.calc_angles(rcal)
         if (len({a: i for i, a in fangles.items()}) != len(fangles)
             or len({a: i for i, a in rangles.items()}) != len(rangles)):
             raise self.printer.command_error(
                 "Failed calibration - sensor not updating for each step")
         merged = { i: fcal[i] + rcal[i] for i in range(full_steps) }
-        angles, std, total = self.calc_angles(merged)
-        gcmd.respond_info("angle: stddev=%.3f (%.3f forward / %.3f reverse)"
-                          " in %d queries" % (std, fstd, rstd, total))
+        angles, std, total, rejected = self.calc_angles(merged)
+        gcmd.respond_info(
+            "angle: stddev=%.3f (%.3f forward / %.3f reverse)"
+            " in %d queries, %d outliers rejected"
+            % (std, fstd, rstd, total, rejected))
         # Order data with lowest/highest magnet position first
         anglist = [angles[i] % 0xffff for i in range(full_steps)]
         if angles[0] > angles[1]:

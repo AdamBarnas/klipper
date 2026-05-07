@@ -198,20 +198,24 @@ class AngleCalibration:
         toolhead.wait_moves()
         # Finish data collection
         is_finished = True
-        # Correlate query responses
+        # Correlate query responses, filtering stale (consecutive duplicate) reads
         cal = {}
+        last_pos_per_step = {}
         step = 0
         for msg in msgs:
             for query_time, pos in msg['data']:
-                # Add to step tracking
                 while step < len(times) and query_time > times[step][1]:
                     step += 1
                 if step < len(times) and query_time >= times[step][0]:
-                    cal.setdefault(step, []).append(pos)
+                    if pos != last_pos_per_step.get(step):
+                        cal.setdefault(step, []).append(pos)
+                        last_pos_per_step[step] = pos
         if len(cal) != len(times):
-            logging.error("Calibration: cal has %d entries, times has %d", len(cal), len(times))
+            logging.error("Calibration: cal has %d entries, times has %d",
+                          len(cal), len(times))
             raise self.printer.command_error(
-                f'Failed calibration - incomplete sensor data ({len(cal)}/{len(times)})')
+                'Failed calibration - incomplete sensor data (%d/%d)'
+                % (len(cal), len(times)))
         fcal = { i: cal[i] for i in range(full_steps) }
         rcal = { full_steps-i-1: cal[i+full_steps] for i in range(full_steps) }
         return fcal, rcal
@@ -232,7 +236,9 @@ class AngleCalibration:
             else:
                 filtered = data
             total_rejected += count - len(filtered)
-            # Second pass: average on filtered data
+            # Second pass: average on filtered data (fall back to all if all rejected)
+            if not filtered:
+                filtered = data
             fcount = len(filtered)
             angle_avg = float(sum(filtered)) / fcount
             angles[step] = angle_avg
@@ -240,29 +246,59 @@ class AngleCalibration:
             total_variance += sum((d - angle_avg)**2 for d in filtered)
         stddev = math.sqrt(total_variance / total_count) if total_count else 0.
         return angles, stddev, total_count, total_rejected
+    def _check_unique_angles(self, angles_dict):
+        # Each full step spans angle_max/full_steps units (~328 for 200-step motor).
+        # Require adjacent sorted averages to differ by at least 10 counts.
+        vals = sorted(angles_dict.values())
+        bad = [(vals[i], vals[i+1]) for i in range(len(vals)-1)
+               if vals[i+1] - vals[i] < 10.]
+        return bad  # empty = all unique
     cmd_ANGLE_CALIBRATE_help = "Calibrate angle sensor to stepper motor"
     def cmd_ANGLE_CALIBRATE(self, gcmd):
-        # Perform calibration movement and capture
-        old_calibration = self.calibration
-        self.calibration = []
-        try:
-            fcal, rcal = self.do_calibration_moves()
-        finally:
-            self.calibration = old_calibration
-        # Calculate each step position average and variance
+        max_attempts = 3
         microsteps, full_steps = self.get_microsteps()
-        fangles, fstd, ftotal, _ = self.calc_angles(fcal)
-        rangles, rstd, rtotal, _ = self.calc_angles(rcal)
-        if (len({a: i for i, a in fangles.items()}) != len(fangles)
-            or len({a: i for i, a in rangles.items()}) != len(rangles)):
-            raise self.printer.command_error(
-                "Failed calibration - sensor not updating for each step")
-        merged = { i: fcal[i] + rcal[i] for i in range(full_steps) }
-        angles, std, total, rejected = self.calc_angles(merged)
-        gcmd.respond_info(
-            "angle: stddev=%.3f (%.3f forward / %.3f reverse)"
-            " in %d queries, %d outliers rejected"
-            % (std, fstd, rstd, total, rejected))
+        last_error = None
+        for attempt in range(max_attempts):
+            if attempt:
+                gcmd.respond_info("Retrying calibration (attempt %d/%d)..."
+                                  % (attempt + 1, max_attempts))
+            # Perform calibration movement and capture
+            old_calibration = self.calibration
+            self.calibration = []
+            try:
+                fcal, rcal = self.do_calibration_moves()
+            finally:
+                self.calibration = old_calibration
+            # Calculate per-step averages
+            fangles, fstd, _, _ = self.calc_angles(fcal)
+            rangles, rstd, _, _ = self.calc_angles(rcal)
+            # Tolerance-based uniqueness check (exact equality is too strict for
+            # sensors with occasional stale SPI reads)
+            fbad = self._check_unique_angles(fangles)
+            rbad = self._check_unique_angles(rangles)
+            if fbad or rbad:
+                for a, b in fbad:
+                    logging.warning("Calibration: forward pass duplicate angles"
+                                    " %.1f / %.1f", a, b)
+                for a, b in rbad:
+                    logging.warning("Calibration: reverse pass duplicate angles"
+                                    " %.1f / %.1f", a, b)
+                last_error = ("Failed calibration - sensor not resolving"
+                              " individual steps (%d forward, %d reverse"
+                              " near-duplicates)" % (len(fbad), len(rbad)))
+                gcmd.respond_info(last_error)
+                continue
+            # Merge and report
+            merged = {i: fcal[i] + rcal[i] for i in range(full_steps)}
+            angles, std, total, rejected = self.calc_angles(merged)
+            gcmd.respond_info(
+                "angle: stddev=%.3f (%.3f forward / %.3f reverse)"
+                " in %d queries, %d outliers rejected"
+                % (std, fstd, rstd, total, rejected))
+            last_error = None
+            break
+        if last_error:
+            raise self.printer.command_error(last_error)
         # Order data with lowest/highest magnet position first
         anglist = [angles[i] % 0xffff for i in range(full_steps)]
         if angles[0] > angles[1]:

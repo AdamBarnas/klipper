@@ -245,15 +245,19 @@ class AngleCalibration:
         return angles, stddev, total_count, total_rejected
     def _analyze_angle_spacing(self, angles_dict, full_steps):
         # Returns (bad_count, min_gap, avg_gap, expected_gap).
-        # A gap is "bad" if it is less than expected_gap/8 — meaning the sensor
-        # could not distinguish those two consecutive step positions.
+        # "bad" means two step averages are indistinguishable — closer than
+        # MIN_RESOLUTION counts.  With many samples per position the noise on
+        # the mean is << 1 count, so 2.0 is a safe noise floor.
+        # The ratio avg_gap/expected_gap is reported separately so the caller
+        # can diagnose wrong-shaft / wrong gear-ratio issues without conflating
+        # them with the unresolvable-step check.
+        MIN_RESOLUTION = 2.0
         expected_gap = float(1 << ANGLE_BITS) / full_steps
-        min_sep = max(5., expected_gap / 8.)
         vals = sorted(angles_dict.values())
         gaps = [vals[i+1] - vals[i] for i in range(len(vals) - 1)]
         if not gaps:
             return 0, 0., 0., expected_gap
-        bad = sum(1 for g in gaps if g < min_sep)
+        bad = sum(1 for g in gaps if g < MIN_RESOLUTION)
         return bad, min(gaps), sum(gaps) / len(gaps), expected_gap
     cmd_ANGLE_CALIBRATE_help = "Calibrate angle sensor to stepper motor"
     def cmd_ANGLE_CALIBRATE(self, gcmd):
@@ -287,18 +291,37 @@ class AngleCalibration:
                     "Calibration spacing: fwd bad=%d min=%.1f avg=%.1f"
                     " rev bad=%d min=%.1f avg=%.1f expected=%.1f",
                     fbad, fmin, favg, rbad, rmin, ravg, exp)
+                avg_step = (favg + ravg) / 2. if (favg and ravg) else (favg or ravg)
+                ratio = exp / avg_step if avg_step > 0. else 0.
+                # Find the closest simple integer ratio (1:1, 2:1, 4:1, ...)
+                common_ratios = [1, 2, 3, 4, 5, 6, 8, 10]
+                nearest = min(common_ratios, key=lambda r: abs(r - ratio))
+                if abs(ratio - nearest) < 0.15 * nearest and nearest > 1:
+                    ratio_hint = (
+                        "  The observed step size is ~1/%d of expected,"
+                        " suggesting the encoder is on a shaft with a %d:1"
+                        " reduction from the motor. The encoder must complete"
+                        " one full revolution per motor revolution for"
+                        " calibration to work." % (nearest, nearest))
+                elif avg_step < 5.:
+                    ratio_hint = (
+                        "  Observed step size is near zero — the sensor may"
+                        " not be receiving valid angle data. Check SPI wiring"
+                        " and magnet placement.")
+                else:
+                    ratio_hint = (
+                        "  Check that the encoder is on the motor shaft and"
+                        " that gear_ratio in [angle] config matches the"
+                        " drivetrain.")
                 last_error = (
                     "Failed calibration - sensor not resolving individual"
                     " steps (%d/%d fwd, %d/%d rev unresolvable).\n"
-                    "  Observed avg step: fwd=%.1f rev=%.1f counts"
-                    " (expected ~%.1f).\n"
-                    "  If counts are much smaller than expected, check that"
-                    " the encoder is mounted on the correct shaft and the"
-                    " magnet gap is within spec."
+                    "  Observed avg step: %.1f counts (expected ~%.1f,"
+                    " ratio ~%.2f).\n%s"
                     % (fbad, full_steps, rbad, full_steps,
-                       favg, ravg, exp))
+                       avg_step, exp, ratio, ratio_hint))
                 gcmd.respond_info(last_error)
-                # If it looks like a hardware problem, don't waste time retrying
+                # Systematic hardware mismatch — retrying won't help
                 if fbad > hardware_threshold or rbad > hardware_threshold:
                     break
                 continue

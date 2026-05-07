@@ -216,26 +216,33 @@ class AngleCalibration:
         fcal = { i: cal[i] for i in range(full_steps) }
         rcal = { full_steps-i-1: cal[i+full_steps] for i in range(full_steps) }
         return fcal, rcal
-    def calc_angles(self, meas, sigma_reject=3.0):
+    def _filter_step_data(self, data, min_tolerance=20.):
+        # SPI errors cause last_angle to jump mid-window, creating two tight
+        # clusters (before and after the jump).  Mean-based sigma rejection
+        # fails when the split is ~50/50 — both clusters pull the mean into
+        # the gap so everything survives 3-sigma.  Instead, anchor to the
+        # INITIAL readings (before any corruption) and keep only the readings
+        # consistent with that reference.
+        if len(data) < 2:
+            return data
+        n_init = max(1, min(10, len(data) // 4))
+        init = data[:n_init]
+        init_mean = float(sum(init)) / len(init)
+        if len(init) > 1:
+            init_std = math.sqrt(
+                sum((d - init_mean)**2 for d in init) / len(init))
+        else:
+            init_std = 0.
+        tolerance = max(min_tolerance, 5. * init_std)
+        filtered = [d for d in data if abs(d - init_mean) <= tolerance]
+        return filtered if filtered else data
+    def calc_angles(self, meas):
         total_count = total_variance = total_rejected = 0
         angles = {}
         for step, data in meas.items():
-            # First pass: compute mean and std for outlier rejection
             count = len(data)
-            mean = float(sum(data)) / count
-            if count > 2:
-                std = math.sqrt(sum((d - mean)**2 for d in data) / count)
-                if std > 0.:
-                    threshold = sigma_reject * std
-                    filtered = [d for d in data if abs(d - mean) <= threshold]
-                else:
-                    filtered = data
-            else:
-                filtered = data
+            filtered = self._filter_step_data(data)
             total_rejected += count - len(filtered)
-            # Second pass: average on filtered data (fall back to all if all rejected)
-            if not filtered:
-                filtered = data
             fcount = len(filtered)
             angle_avg = float(sum(filtered)) / fcount
             angles[step] = angle_avg

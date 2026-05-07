@@ -198,18 +198,15 @@ class AngleCalibration:
         toolhead.wait_moves()
         # Finish data collection
         is_finished = True
-        # Correlate query responses, filtering stale (consecutive duplicate) reads
+        # Correlate query responses
         cal = {}
-        last_pos_per_step = {}
         step = 0
         for msg in msgs:
             for query_time, pos in msg['data']:
                 while step < len(times) and query_time > times[step][1]:
                     step += 1
                 if step < len(times) and query_time >= times[step][0]:
-                    if pos != last_pos_per_step.get(step):
-                        cal.setdefault(step, []).append(pos)
-                        last_pos_per_step[step] = pos
+                    cal.setdefault(step, []).append(pos)
         if len(cal) != len(times):
             logging.error("Calibration: cal has %d entries, times has %d",
                           len(cal), len(times))
@@ -246,17 +243,25 @@ class AngleCalibration:
             total_variance += sum((d - angle_avg)**2 for d in filtered)
         stddev = math.sqrt(total_variance / total_count) if total_count else 0.
         return angles, stddev, total_count, total_rejected
-    def _check_unique_angles(self, angles_dict):
-        # Each full step spans angle_max/full_steps units (~328 for 200-step motor).
-        # Require adjacent sorted averages to differ by at least 10 counts.
+    def _analyze_angle_spacing(self, angles_dict, full_steps):
+        # Returns (bad_count, min_gap, avg_gap, expected_gap).
+        # A gap is "bad" if it is less than expected_gap/8 — meaning the sensor
+        # could not distinguish those two consecutive step positions.
+        expected_gap = float(1 << ANGLE_BITS) / full_steps
+        min_sep = max(5., expected_gap / 8.)
         vals = sorted(angles_dict.values())
-        bad = [(vals[i], vals[i+1]) for i in range(len(vals)-1)
-               if vals[i+1] - vals[i] < 10.]
-        return bad  # empty = all unique
+        gaps = [vals[i+1] - vals[i] for i in range(len(vals) - 1)]
+        if not gaps:
+            return 0, 0., 0., expected_gap
+        bad = sum(1 for g in gaps if g < min_sep)
+        return bad, min(gaps), sum(gaps) / len(gaps), expected_gap
     cmd_ANGLE_CALIBRATE_help = "Calibrate angle sensor to stepper motor"
     def cmd_ANGLE_CALIBRATE(self, gcmd):
-        max_attempts = 3
         microsteps, full_steps = self.get_microsteps()
+        # Retry only for occasional read failures; bail immediately for
+        # systematic hardware problems (> 20% of steps unresolvable).
+        hardware_threshold = full_steps // 5
+        max_attempts = 3
         last_error = None
         for attempt in range(max_attempts):
             if attempt:
@@ -272,21 +277,30 @@ class AngleCalibration:
             # Calculate per-step averages
             fangles, fstd, _, _ = self.calc_angles(fcal)
             rangles, rstd, _, _ = self.calc_angles(rcal)
-            # Tolerance-based uniqueness check (exact equality is too strict for
-            # sensors with occasional stale SPI reads)
-            fbad = self._check_unique_angles(fangles)
-            rbad = self._check_unique_angles(rangles)
+            # Check that the sensor resolved individual motor steps
+            fbad, fmin, favg, exp = self._analyze_angle_spacing(fangles,
+                                                                 full_steps)
+            rbad, rmin, ravg, _  = self._analyze_angle_spacing(rangles,
+                                                                 full_steps)
             if fbad or rbad:
-                for a, b in fbad:
-                    logging.warning("Calibration: forward pass duplicate angles"
-                                    " %.1f / %.1f", a, b)
-                for a, b in rbad:
-                    logging.warning("Calibration: reverse pass duplicate angles"
-                                    " %.1f / %.1f", a, b)
-                last_error = ("Failed calibration - sensor not resolving"
-                              " individual steps (%d forward, %d reverse"
-                              " near-duplicates)" % (len(fbad), len(rbad)))
+                logging.warning(
+                    "Calibration spacing: fwd bad=%d min=%.1f avg=%.1f"
+                    " rev bad=%d min=%.1f avg=%.1f expected=%.1f",
+                    fbad, fmin, favg, rbad, rmin, ravg, exp)
+                last_error = (
+                    "Failed calibration - sensor not resolving individual"
+                    " steps (%d/%d fwd, %d/%d rev unresolvable).\n"
+                    "  Observed avg step: fwd=%.1f rev=%.1f counts"
+                    " (expected ~%.1f).\n"
+                    "  If counts are much smaller than expected, check that"
+                    " the encoder is mounted on the correct shaft and the"
+                    " magnet gap is within spec."
+                    % (fbad, full_steps, rbad, full_steps,
+                       favg, ravg, exp))
                 gcmd.respond_info(last_error)
+                # If it looks like a hardware problem, don't waste time retrying
+                if fbad > hardware_threshold or rbad > hardware_threshold:
+                    break
                 continue
             # Merge and report
             merged = {i: fcal[i] + rcal[i] for i in range(full_steps)}

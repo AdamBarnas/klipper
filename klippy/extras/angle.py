@@ -951,6 +951,7 @@ class Angle:
         static_delay = 0.
         last_chip_mcu_clock = last_chip_clock = chip_freq = inv_chip_freq = 0.
         is_tcode_absolute = self.sensor_helper.is_tcode_absolute
+        is_14bit = self.sensor_type == 'mt6835'
         if is_tcode_absolute:
             tparams = self.sensor_helper.get_tcode_params()
             last_chip_mcu_clock, last_chip_clock, chip_freq = tparams
@@ -977,6 +978,11 @@ class Angle:
                     error_count += 1
                     continue
                 raw_angle = d_ta[1] | (d_ta[2] << 8)
+                if is_14bit:
+                    # MT6835 bulk data is 14-bit (0-16383). Scale to 16-bit
+                    # so wraparound and calibration arithmetic are consistent
+                    # with all other sensors that use the full 0-65535 range.
+                    raw_angle <<= 2
                 angle_diff = (raw_angle - last_angle) & 0xffff
                 angle_diff -= (angle_diff & 0x8000) << 1
                 last_angle += angle_diff

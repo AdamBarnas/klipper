@@ -35,7 +35,10 @@ enum {
     SE_OVERFLOW, SE_SCHEDULE, SE_SPI_TIME, SE_CRC, SE_DUP, SE_NO_ANGLE
 };
 
+// Maximum SPI read time for sensors with 2-3 byte messages
 #define MAX_SPI_READ_TIME timer_from_us(80)
+// MT6835 uses a 6-byte burst; at 500 kHz that takes ~96 us, so give it room
+#define MAX_SPI_READ_TIME_MT6835 timer_from_us(160)
 
 #define MT6835_STATUS_OVERSPEED_MASK    0x01
 #define MT6835_STATUS_WEAK_SIGNAL_MASK  0x02
@@ -220,7 +223,7 @@ static void mt6835_query(struct spi_angle *sa, uint32_t stime)
     uint32_t mtime1 = timer_read_time();
     spidev_transfer(sa->spi, 1, sizeof(msg), msg);
     uint32_t mtime2 = timer_read_time();
-    if (mtime2 - mtime1 > MAX_SPI_READ_TIME) {
+    if (mtime2 - mtime1 > MAX_SPI_READ_TIME_MT6835) {
         angle_add_error(sa, SE_SPI_TIME);
         return;
     }

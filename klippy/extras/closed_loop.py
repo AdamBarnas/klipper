@@ -38,9 +38,10 @@
 #   enabled: True
 #
 # GCode commands (all take AXIS=<name> to select the instance):
-#   CLOSED_LOOP_STATUS  AXIS=x
-#   CLOSED_LOOP_CORRECT AXIS=x
-#   CLOSED_LOOP_ENABLE  AXIS=x ENABLE=0|1
+#   CLOSED_LOOP_STATUS        AXIS=x
+#   CLOSED_LOOP_CORRECT       AXIS=x
+#   CLOSED_LOOP_ENABLE        AXIS=x ENABLE=0|1
+#   CLOSED_LOOP_AUTO_CORRECT  AXIS=x ENABLE=0|1
 
 import logging
 
@@ -164,11 +165,12 @@ class ClosedLoop:
         self._axis_idx       = {'x': 0, 'y': 1, 'z': 2}[axis]
         self._stepper_name   = 'stepper_%s' % axis   # matched against sync_mcu_position
         self._sensor_name    = config.get('sensor', '%s_angle_sensor' % axis)
-        self._corr_threshold = config.getfloat('correction_threshold_mm', 0.1,  above=0.)
-        self._stall_threshold= config.getfloat('stall_threshold_mm',      2.0,  above=0.)
-        self._corr_speed     = config.getfloat('correction_speed',        20.,  above=0.)
-        self._monitor_ivl    = config.getfloat('monitor_interval',        0.25, above=0.)
-        self._enabled        = config.getboolean('enabled', True)
+        self._corr_threshold      = config.getfloat('correction_threshold_mm', 0.1,  above=0.)
+        self._stall_threshold     = config.getfloat('stall_threshold_mm',      2.0,  above=0.)
+        self._corr_speed          = config.getfloat('correction_speed',        20.,  above=0.)
+        self._monitor_ivl         = config.getfloat('monitor_interval',        0.25, above=0.)
+        self._enabled             = config.getboolean('enabled', True)
+        self._auto_correct_stall  = config.getboolean('auto_correct_on_stall', False)
 
         # ErrorTracker is built in _handle_connect once mm_per_count is known.
         self._tracker = None
@@ -181,9 +183,12 @@ class ClosedLoop:
         self._timer      = None
 
         # ── Internal state ───────────────────────────────────────────────────
-        self._pending_home_capture = False   # set by sync event, cleared by batch handler
-        self._pending_correction   = False   # prevents overlapping correction moves
-        self._last_stall_time      = 0.
+        self._pending_home_capture  = False  # set by sync event, cleared by batch handler
+        self._pending_correction    = False  # prevents overlapping correction moves
+        self._stall_correct_pending = False  # stall detected, correct on next idle tick
+        self._last_move_speed       = self._corr_speed  # updated every timer tick
+        self._last_stall_time       = 0.
+        self._step_enable           = None   # populated at connect
 
         # ── Klipper lifecycle ─────────────────────────────────────────────────
         self.printer.register_event_handler("klippy:connect",    self._handle_connect)
@@ -207,6 +212,10 @@ class ClosedLoop:
             'CLOSED_LOOP_ENABLE', 'AXIS', self.name,
             self.cmd_CLOSED_LOOP_ENABLE,
             desc="Enable or disable closed-loop monitoring (ENABLE=0|1)")
+        self._gcode.register_mux_command(
+            'CLOSED_LOOP_AUTO_CORRECT', 'AXIS', self.name,
+            self.cmd_CLOSED_LOOP_AUTO_CORRECT,
+            desc="Enable or disable auto-correction on stall detection (ENABLE=0|1)")
 
     # =========================================================================
     # Klipper lifecycle
@@ -219,6 +228,9 @@ class ClosedLoop:
         mm_per_count  = self._lookup_mm_per_count()
         self._tracker = ErrorTracker(self._corr_threshold, self._stall_threshold,
                                      mm_per_count)
+
+        stepper_enable   = self.printer.lookup_object('stepper_enable')
+        self._step_enable = stepper_enable.lookup_enable(self._stepper_name)
 
         angle_obj = self.printer.lookup_object('angle %s' % self._sensor_name)
         angle_obj.add_client(self._angle_batch_handler)
@@ -305,22 +317,36 @@ class ClosedLoop:
         if not self._enabled or not self._tracker or not self._tracker.has_data():
             return eventtime + self._monitor_ivl
 
+        # Track last move speed every tick so it reflects the most recent move.
+        self._last_move_speed = self._gcode_move.speed
+
         commanded = self._toolhead.get_position()[self._axis_idx]
 
         # ── Stall detection (checked regardless of motion state) ──────────────
         if self._tracker.is_stall(commanded):
             self._handle_stall(commanded, eventtime)
-            return eventtime + self._monitor_ivl
+            # Don't return early — still fall through to the idle correction
+            # check so a stall-triggered correction is applied as soon as the
+            # toolhead stops moving.
 
-        # ── Correction (only when toolhead is idle and no correction queued) ──
+        # ── Idle corrections (normal drift and pending stall corrections) ──────
         if not self._pending_correction:
             th_status = self._toolhead.get_status(eventtime).get('status', '')
             if th_status == TOOLHEAD_IDLE_STATUS:
-                needs, err = self._tracker.needs_correction(commanded)
-                if needs:
-                    self._pending_correction = True
+                if self._stall_correct_pending:
+                    # Stall correction takes priority; use speed of the last move.
+                    self._stall_correct_pending = False
+                    self._pending_correction    = True
+                    speed = self._last_move_speed
                     self._reactor.register_callback(
-                        lambda et: self._apply_correction_cb(commanded, err))
+                        lambda et: self._apply_correction_cb(commanded, speed))
+                else:
+                    needs, err = self._tracker.needs_correction(commanded)
+                    if needs:
+                        self._pending_correction = True
+                        self._reactor.register_callback(
+                            lambda et: self._apply_correction_cb(
+                                commanded, self._corr_speed))
 
         return eventtime + self._monitor_ivl
 
@@ -329,6 +355,14 @@ class ClosedLoop:
     # =========================================================================
 
     def _handle_stall(self, commanded, eventtime):
+        motors_on = self._step_enable is not None and self._step_enable.is_motor_enabled()
+
+        # Queue auto-correction when conditions are met.
+        # The actual move is deferred to the next idle tick via _stall_correct_pending.
+        if self._auto_correct_stall and motors_on:
+            self._stall_correct_pending = True
+
+        # Log at most once per cooldown period to avoid console spam.
         if eventtime - self._last_stall_time < STALL_LOG_COOLDOWN:
             return
         self._last_stall_time = eventtime
@@ -337,10 +371,17 @@ class ClosedLoop:
         logging.warning(
             "closed_loop %s: stall detected — error=%.4f mm (total stalls: %d)",
             self.name, err, self._tracker.stall_count)
-        self._gcode.respond_info(
-            "!! CLOSED_LOOP %s: stall detected! error=%.4f mm "
-            "(total stalls: %d; home the axis or use CLOSED_LOOP_CORRECT AXIS=%s)"
-            % (self.name.upper(), err, self._tracker.stall_count, self.name))
+
+        if self._auto_correct_stall and motors_on:
+            self._gcode.respond_info(
+                "!! CLOSED_LOOP %s: stall detected! error=%.4f mm — "
+                "auto-correction queued (total stalls: %d)"
+                % (self.name.upper(), err, self._tracker.stall_count))
+        else:
+            self._gcode.respond_info(
+                "!! CLOSED_LOOP %s: stall detected! error=%.4f mm "
+                "(total stalls: %d; home the axis or use CLOSED_LOOP_CORRECT AXIS=%s)"
+                % (self.name.upper(), err, self._tracker.stall_count, self.name))
 
     # =========================================================================
     # Correction move
@@ -354,7 +395,7 @@ class ClosedLoop:
     # the logical coordinate system seen by the rest of the print.
     # =========================================================================
 
-    def _apply_correction_cb(self, original_commanded, original_err):
+    def _apply_correction_cb(self, original_commanded, speed):
         """Reactor callback wrapper — re-validates before moving."""
         try:
             if not self._enabled or not self._tracker or not self._tracker.has_data():
@@ -366,12 +407,14 @@ class ClosedLoop:
             needs, err = self._tracker.needs_correction(commanded)
             if not needs:
                 return
-            self._apply_correction(commanded, err)
+            self._apply_correction(commanded, err, speed)
         finally:
             self._pending_correction = False
 
-    def _apply_correction(self, commanded_mm, error_mm):
+    def _apply_correction(self, commanded_mm, error_mm, speed=None):
         """Issue the correction move.  May be called from reactor callback or gcode."""
+        if speed is None:
+            speed = self._corr_speed
         sensor_mm   = self._tracker.get_sensor_position()
         current_pos = list(self._toolhead.get_position())
 
@@ -385,7 +428,7 @@ class ClosedLoop:
         self._toolhead.set_position(actual_pos)
 
         # Step 2: move back to the commanded position (executes the missing steps).
-        self._toolhead.move(target_pos, self._corr_speed)
+        self._toolhead.move(target_pos, speed)
 
         # Step 3: sync the gcode coordinate layer so user-visible position stays consistent.
         self._gcode_move.reset_last_position()
@@ -393,9 +436,9 @@ class ClosedLoop:
         self._tracker.record_correction()
         logging.info(
             "closed_loop %s: correction #%d — sensor=%.4f mm  commanded=%.4f mm  "
-            "error=%.4f mm",
+            "error=%.4f mm  speed=%.1f mm/s",
             self.name, self._tracker.correction_count,
-            sensor_mm, commanded_mm, error_mm)
+            sensor_mm, commanded_mm, error_mm, speed)
 
     # =========================================================================
     # GCode commands
@@ -446,6 +489,17 @@ class ClosedLoop:
             "CLOSED_LOOP [%s]: %s"
             % (self.name, "enabled" if self._enabled else "disabled"))
 
+    def cmd_CLOSED_LOOP_AUTO_CORRECT(self, gcmd):
+        """Toggle automatic correction on stall detection."""
+        self._auto_correct_stall = bool(gcmd.get_int('ENABLE', 1, minval=0, maxval=1))
+        if self._auto_correct_stall:
+            gcmd.respond_info(
+                "CLOSED_LOOP [%s]: auto-correct on stall ENABLED "
+                "(uses speed of last move)" % self.name)
+        else:
+            gcmd.respond_info(
+                "CLOSED_LOOP [%s]: auto-correct on stall DISABLED" % self.name)
+
     # =========================================================================
     # Moonraker / status API
     # =========================================================================
@@ -455,12 +509,13 @@ class ClosedLoop:
                      if self._toolhead else 0.)
         tracker = self._tracker
         return {
-            'enabled':         self._enabled,
-            'is_homed':        tracker.has_data()          if tracker else False,
-            'sensor_position': tracker.get_sensor_position() if tracker else None,
-            'error':           tracker.compute_error(commanded) if tracker else None,
-            'corrections':     tracker.correction_count    if tracker else 0,
-            'stalls':          tracker.stall_count         if tracker else 0,
+            'enabled':              self._enabled,
+            'auto_correct_on_stall': self._auto_correct_stall,
+            'is_homed':             tracker.has_data()             if tracker else False,
+            'sensor_position':      tracker.get_sensor_position()  if tracker else None,
+            'error':                tracker.compute_error(commanded) if tracker else None,
+            'corrections':          tracker.correction_count       if tracker else 0,
+            'stalls':               tracker.stall_count            if tracker else 0,
         }
 
 

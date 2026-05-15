@@ -149,8 +149,7 @@ class ErrorTracker:
 # Everything else (printer, toolhead, gcode, reactor) lives in this section.
 # ===========================================================================
 
-TOOLHEAD_IDLE_STATUS = 'Ready'
-STALL_LOG_COOLDOWN   = 5.0    # seconds — prevents log spam for a persistent stall
+STALL_LOG_COOLDOWN = 5.0    # seconds — prevents log spam for a persistent stall
 
 
 class ClosedLoop:
@@ -331,8 +330,9 @@ class ClosedLoop:
 
         # ── Idle corrections (normal drift and pending stall corrections) ──────
         if not self._pending_correction:
-            th_status = self._toolhead.get_status(eventtime).get('status', '')
-            if th_status == TOOLHEAD_IDLE_STATUS:
+            print_time, est_print_time, lookahead_empty = \
+                self._toolhead.check_busy(eventtime)
+            if lookahead_empty and est_print_time > print_time:
                 if self._stall_correct_pending:
                     # Stall correction takes priority; use speed of the last move.
                     self._stall_correct_pending = False
@@ -400,8 +400,10 @@ class ClosedLoop:
         try:
             if not self._enabled or not self._tracker or not self._tracker.has_data():
                 return
-            th_status = self._toolhead.get_status(None).get('status', '')
-            if th_status != TOOLHEAD_IDLE_STATUS:
+            eventtime = self._reactor.monotonic()
+            print_time, est_print_time, lookahead_empty = \
+                self._toolhead.check_busy(eventtime)
+            if not lookahead_empty or est_print_time <= print_time:
                 return
             commanded = self._toolhead.get_position()[self._axis_idx]
             needs, err = self._tracker.needs_correction(commanded)

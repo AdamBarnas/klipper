@@ -188,6 +188,7 @@ class ClosedLoop:
         self._last_move_speed       = self._corr_speed  # updated every timer tick
         self._last_stall_time       = 0.
         self._step_enable           = None   # populated at connect
+        self._is_homing             = False  # suppresses checks during homing moves
 
         # ── Klipper lifecycle ─────────────────────────────────────────────────
         self.printer.register_event_handler("klippy:connect",    self._handle_connect)
@@ -197,6 +198,14 @@ class ClosedLoop:
         # position — this happens at the end of every homing move.
         self.printer.register_event_handler("stepper:sync_mcu_position",
                                             self._handle_sync_mcu_pos)
+
+        # homing:home_rails_begin/end bracket the full homing sequence including
+        # the approach move, endstop trigger, retract, and second approach.
+        # All stall detection and correction is suppressed while homing is active.
+        self.printer.register_event_handler("homing:home_rails_begin",
+                                            self._handle_home_begin)
+        self.printer.register_event_handler("homing:home_rails_end",
+                                            self._handle_home_end)
 
         # ── GCode commands ────────────────────────────────────────────────────
         self._gcode.register_mux_command(
@@ -273,6 +282,25 @@ class ClosedLoop:
                 "will capture home reference on next angle batch",
                 self.name, self._stepper_name)
 
+    def _axis_in_rails(self, rails):
+        """True if this axis's stepper is among the rails being homed."""
+        for rail in rails:
+            for stepper in rail.get_steppers():
+                if stepper.get_name() == self._stepper_name:
+                    return True
+        return False
+
+    def _handle_home_begin(self, homing_state, rails):
+        if self._axis_in_rails(rails):
+            self._is_homing = True
+            self._stall_correct_pending = False  # discard any queued stall correction
+            logging.info("closed_loop %s: homing started — checks suppressed", self.name)
+
+    def _handle_home_end(self, homing_state, rails):
+        if self._axis_in_rails(rails):
+            self._is_homing = False
+            logging.info("closed_loop %s: homing finished — checks resumed", self.name)
+
     # =========================================================================
     # Angle-sensor boundary
     #
@@ -316,37 +344,41 @@ class ClosedLoop:
         if not self._enabled or not self._tracker or not self._tracker.has_data():
             return eventtime + self._monitor_ivl
 
-        # Track last move speed every tick so it reflects the most recent move.
+        if self._is_homing:
+            return eventtime + self._monitor_ivl
+
+        # Track last move speed on every tick so it reflects the most recent move.
         self._last_move_speed = self._gcode_move.speed
+
+        # Stall detection and corrections are only meaningful when the toolhead
+        # is idle.  During a move, commanded position leads actual position
+        # through the look-ahead buffer, so the apparent error is not a stall.
+        print_time, est_print_time, lookahead_empty = \
+            self._toolhead.check_busy(eventtime)
+        if not lookahead_empty or est_print_time <= print_time:
+            return eventtime + self._monitor_ivl
 
         commanded = self._toolhead.get_position()[self._axis_idx]
 
-        # ── Stall detection (checked regardless of motion state) ──────────────
+        # ── Stall detection ───────────────────────────────────────────────────
         if self._tracker.is_stall(commanded):
             self._handle_stall(commanded, eventtime)
-            # Don't return early — still fall through to the idle correction
-            # check so a stall-triggered correction is applied as soon as the
-            # toolhead stops moving.
 
-        # ── Idle corrections (normal drift and pending stall corrections) ──────
+        # ── Corrections (stall-triggered or normal drift) ─────────────────────
         if not self._pending_correction:
-            print_time, est_print_time, lookahead_empty = \
-                self._toolhead.check_busy(eventtime)
-            if lookahead_empty and est_print_time > print_time:
-                if self._stall_correct_pending:
-                    # Stall correction takes priority; use speed of the last move.
-                    self._stall_correct_pending = False
-                    self._pending_correction    = True
-                    speed = self._last_move_speed
+            if self._stall_correct_pending:
+                self._stall_correct_pending = False
+                self._pending_correction    = True
+                speed = self._last_move_speed
+                self._reactor.register_callback(
+                    lambda et: self._apply_correction_cb(commanded, speed))
+            else:
+                needs, err = self._tracker.needs_correction(commanded)
+                if needs:
+                    self._pending_correction = True
                     self._reactor.register_callback(
-                        lambda et: self._apply_correction_cb(commanded, speed))
-                else:
-                    needs, err = self._tracker.needs_correction(commanded)
-                    if needs:
-                        self._pending_correction = True
-                        self._reactor.register_callback(
-                            lambda et: self._apply_correction_cb(
-                                commanded, self._corr_speed))
+                        lambda et: self._apply_correction_cb(
+                            commanded, self._corr_speed))
 
         return eventtime + self._monitor_ivl
 
@@ -399,6 +431,8 @@ class ClosedLoop:
         """Reactor callback wrapper — re-validates before moving."""
         try:
             if not self._enabled or not self._tracker or not self._tracker.has_data():
+                return
+            if self._is_homing:
                 return
             eventtime = self._reactor.monotonic()
             print_time, est_print_time, lookahead_empty = \

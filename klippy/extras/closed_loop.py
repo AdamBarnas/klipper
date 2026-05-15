@@ -13,6 +13,21 @@
 # │                  All printer / toolhead / gcode / reactor calls here.  │
 # └─────────────────────────────────────────────────────────────────────────┘
 #
+# Position tracking strategy
+# ──────────────────────────
+# The reference point is captured from the angle sensor immediately after the
+# axis is homed (stepper:sync_mcu_position event → next angle batch).
+# Subsequent sensor positions are computed as:
+#
+#   sensor_pos_mm = home_pos_mm + (current_angle - home_angle) * mm_per_count
+#
+# where current_angle is the calibrated, accumulated angle from the angle
+# module's batch stream (msg['data'][-1][1]).  Using the accumulated value
+# (which grows beyond 65535 across revolutions) means no special wraparound
+# handling is needed.  The calibration lookup in the angle module already
+# linearises the sensor and flips direction, so the angle always increases
+# with increasing commanded position.
+#
 # Config:
 #   [closed_loop x]
 #   sensor: x_angle_sensor          # name of the [angle] section (no "angle " prefix)
@@ -33,50 +48,79 @@ import logging
 # PURE DOMAIN LOGIC
 #
 # No Klipper objects, printer references, or hardware access below this line.
-# All values in mm, in commanded-position coordinate space.
+# All values in mm / angle counts.
 # ===========================================================================
 
 class ErrorTracker:
-    """Tracks position error between angle-sensor readings and commanded position."""
+    """Tracks position error between the angle sensor and the commanded position.
 
-    def __init__(self, correction_threshold, stall_threshold):
+    Reference is established at homing via set_home_reference().
+    All subsequent sensor positions are derived from the accumulated angle
+    delta since that moment.
+    """
+
+    def __init__(self, correction_threshold, stall_threshold, mm_per_count):
         if stall_threshold <= correction_threshold:
             raise ValueError("stall_threshold_mm must exceed correction_threshold_mm")
         self.correction_threshold = correction_threshold
-        self.stall_threshold = stall_threshold
+        self.stall_threshold      = stall_threshold
+        self._mm_per_count        = mm_per_count   # rotation_distance / 65536
 
-        self._sensor_pos = None     # latest calibrated reading from the angle sensor (mm)
+        # Homing reference — set by set_home_reference(), cleared on klippy:connect
+        self._is_homed     = False
+        self._home_angle   = None   # calibrated accumulated angle at homing
+        self._home_pos_mm  = None   # commanded position at homing (usually 0)
+
+        # Live state — updated by update_angle() on every batch
+        self._current_angle = None
+
         self._correction_count = 0
-        self._stall_count = 0
+        self._stall_count      = 0
 
-    # ── Data ingestion ───────────────────────────────────────────────────────
+    # ── Reference capture ────────────────────────────────────────────────────
 
-    def update_sensor_position(self, pos_mm):
-        self._sensor_pos = pos_mm
+    def set_home_reference(self, calibrated_angle, commanded_pos_mm):
+        """Establish the sensor zero-point.  Must be called after each homing."""
+        self._home_angle    = calibrated_angle
+        self._home_pos_mm   = commanded_pos_mm
+        self._current_angle = calibrated_angle
+        self._is_homed      = True
+
+    # ── Live update ──────────────────────────────────────────────────────────
+
+    def update_angle(self, calibrated_angle):
+        """Ingest the latest calibrated accumulated angle from the batch stream."""
+        self._current_angle = calibrated_angle
 
     # ── Queries ──────────────────────────────────────────────────────────────
 
     def has_data(self):
-        return self._sensor_pos is not None
+        """True only after the axis has been homed at least once."""
+        return self._is_homed and self._current_angle is not None
 
     def get_sensor_position(self):
-        return self._sensor_pos
+        """Current sensor-derived position in mm, or None if not homed."""
+        if not self.has_data():
+            return None
+        return (self._home_pos_mm
+                + (self._current_angle - self._home_angle) * self._mm_per_count)
 
     def compute_error(self, commanded_mm):
-        """Signed error (mm). Positive means the stepper is behind commanded position."""
-        if self._sensor_pos is None:
+        """Signed error (mm).  Positive = stepper is behind commanded position."""
+        sensor = self.get_sensor_position()
+        if sensor is None:
             return None
-        return commanded_mm - self._sensor_pos
+        return commanded_mm - sensor
 
     def needs_correction(self, commanded_mm):
-        """Returns (bool, error_mm). True when |error| exceeds correction_threshold."""
+        """Returns (bool, error_mm).  True when |error| > correction_threshold."""
         err = self.compute_error(commanded_mm)
         if err is None:
             return False, 0.
         return abs(err) > self.correction_threshold, err
 
     def is_stall(self, commanded_mm):
-        """True when |error| exceeds stall_threshold."""
+        """True when |error| > stall_threshold."""
         err = self.compute_error(commanded_mm)
         return err is not None and abs(err) > self.stall_threshold
 
@@ -112,21 +156,22 @@ class ClosedLoop:
     """Klipper extra: continuous closed-loop position correction for one axis."""
 
     def __init__(self, config):
-        self.printer  = config.get_printer()
-        self.name     = config.get_name().split()[-1]   # 'x' / 'y' from [closed_loop x]
+        self.printer = config.get_printer()
+        self.name    = config.get_name().split()[-1]   # 'x' / 'y' from [closed_loop x]
 
         # ── Config ───────────────────────────────────────────────────────────
         axis = config.get('axis', self.name).lower()
         self._axis_idx       = {'x': 0, 'y': 1, 'z': 2}[axis]
+        self._stepper_name   = 'stepper_%s' % axis   # matched against sync_mcu_position
         self._sensor_name    = config.get('sensor', '%s_angle_sensor' % axis)
-        corr_threshold       = config.getfloat('correction_threshold_mm', 0.1, above=0.)
-        stall_threshold      = config.getfloat('stall_threshold_mm',      2.0, above=0.)
-        self._corr_speed     = config.getfloat('correction_speed',        20., above=0.)
+        self._corr_threshold = config.getfloat('correction_threshold_mm', 0.1,  above=0.)
+        self._stall_threshold= config.getfloat('stall_threshold_mm',      2.0,  above=0.)
+        self._corr_speed     = config.getfloat('correction_speed',        20.,  above=0.)
         self._monitor_ivl    = config.getfloat('monitor_interval',        0.25, above=0.)
         self._enabled        = config.getboolean('enabled', True)
 
-        # ── Domain logic (pure Python, no Klipper) ───────────────────────────
-        self._tracker = ErrorTracker(corr_threshold, stall_threshold)
+        # ErrorTracker is built in _handle_connect once mm_per_count is known.
+        self._tracker = None
 
         # ── Klipper handles — populated at klippy:connect ────────────────────
         self._toolhead   = None
@@ -136,12 +181,18 @@ class ClosedLoop:
         self._timer      = None
 
         # ── Internal state ───────────────────────────────────────────────────
-        self._pending_correction = False   # prevents overlapping correction moves
-        self._last_stall_time    = 0.
+        self._pending_home_capture = False   # set by sync event, cleared by batch handler
+        self._pending_correction   = False   # prevents overlapping correction moves
+        self._last_stall_time      = 0.
 
         # ── Klipper lifecycle ─────────────────────────────────────────────────
         self.printer.register_event_handler("klippy:connect",    self._handle_connect)
         self.printer.register_event_handler("klippy:disconnect", self._handle_disconnect)
+
+        # stepper:sync_mcu_position fires whenever Klipper resets a stepper's
+        # position — this happens at the end of every homing move.
+        self.printer.register_event_handler("stepper:sync_mcu_position",
+                                            self._handle_sync_mcu_pos)
 
         # ── GCode commands ────────────────────────────────────────────────────
         self._gcode.register_mux_command(
@@ -165,36 +216,82 @@ class ClosedLoop:
         self._toolhead   = self.printer.lookup_object('toolhead')
         self._gcode_move = self.printer.lookup_object('gcode_move')
 
-        # Subscribe to the angle sensor's batch stream.
-        # This also starts the sensor measurement if it isn't running yet.
+        mm_per_count  = self._lookup_mm_per_count()
+        self._tracker = ErrorTracker(self._corr_threshold, self._stall_threshold,
+                                     mm_per_count)
+
         angle_obj = self.printer.lookup_object('angle %s' % self._sensor_name)
         angle_obj.add_client(self._angle_batch_handler)
 
-        # Start the continuous monitoring timer.
         self._timer = self._reactor.register_timer(
             self._monitor_timer,
             self._reactor.monotonic() + self._monitor_ivl)
 
-        logging.info("closed_loop %s: connected, monitoring 'angle %s'",
-                     self.name, self._sensor_name)
+        logging.info(
+            "closed_loop %s: connected — stepper=%s  sensor='angle %s'  "
+            "mm_per_count=%.8f  (home the axis to activate)",
+            self.name, self._stepper_name, self._sensor_name, mm_per_count)
 
     def _handle_disconnect(self):
         if self._timer is not None:
             self._reactor.unregister_timer(self._timer)
             self._timer = None
 
+    def _lookup_mm_per_count(self):
+        """Compute mm per 16-bit angle count from the stepper's rotation_distance."""
+        configfile = self.printer.lookup_object('configfile')
+        settings   = configfile.get_status(None)['settings']
+        stconfig   = settings.get(self._stepper_name, {})
+        rotation_distance = stconfig.get('rotation_distance', 40.0)
+        # The angle module scales all sensors to 16-bit (65536 counts/revolution).
+        return rotation_distance / 65536.0
+
+    # =========================================================================
+    # Homing event boundary
+    #
+    # stepper:sync_mcu_position is fired by Klipper at the end of every homing
+    # move, passing the mcu_stepper object whose position was just reset.
+    # We set a flag so the very next angle batch is used as the home reference.
+    # =========================================================================
+
+    def _handle_sync_mcu_pos(self, mcu_stepper):
+        if mcu_stepper.get_name() == self._stepper_name:
+            self._pending_home_capture = True
+            logging.info(
+                "closed_loop %s: homing detected for %s — "
+                "will capture home reference on next angle batch",
+                self.name, self._stepper_name)
+
     # =========================================================================
     # Angle-sensor boundary
     #
     # Called by the angle module every ~100 ms with a batch of calibrated
-    # samples.  The only Klipper object touched here is the batch message dict.
-    # All business logic is delegated to ErrorTracker.
+    # samples.  msg['data'] is a list of (time, calibrated_accumulated_angle)
+    # tuples.  The angles are already linearised and direction-corrected by
+    # apply_calibration() in the angle module — they increase monotonically
+    # with increasing commanded position regardless of sensor orientation.
     # =========================================================================
 
     def _angle_batch_handler(self, msg):
-        offset = msg.get('position_offset')     # calibrated position in mm, or None
-        if offset is not None:
-            self._tracker.update_sensor_position(offset)
+        samples = msg.get('data', [])
+        if not samples:
+            return True
+
+        _, latest_angle = samples[-1]
+
+        if self._pending_home_capture and self._toolhead is not None:
+            # Axis was just homed.  Commanded position is now the endstop value
+            # (typically 0 for X, position_max for Y with homing_positive_dir).
+            commanded = self._toolhead.get_position()[self._axis_idx]
+            self._tracker.set_home_reference(latest_angle, commanded)
+            self._pending_home_capture = False
+            logging.info(
+                "closed_loop %s: home reference set — "
+                "angle=%.1f  commanded=%.4f mm",
+                self.name, latest_angle, commanded)
+        else:
+            self._tracker.update_angle(latest_angle)
+
         return True     # True = keep streaming; False = unsubscribe
 
     # =========================================================================
@@ -205,7 +302,7 @@ class ClosedLoop:
     # =========================================================================
 
     def _monitor_timer(self, eventtime):
-        if not self._enabled or not self._tracker.has_data():
+        if not self._enabled or not self._tracker or not self._tracker.has_data():
             return eventtime + self._monitor_ivl
 
         commanded = self._toolhead.get_position()[self._axis_idx]
@@ -222,9 +319,6 @@ class ClosedLoop:
                 needs, err = self._tracker.needs_correction(commanded)
                 if needs:
                     self._pending_correction = True
-                    # Defer the actual move one reactor iteration to avoid
-                    # potential re-entrancy with the timer callback chain.
-                    # (Pattern matches delayed_gcode's approach.)
                     self._reactor.register_callback(
                         lambda et: self._apply_correction_cb(commanded, err))
 
@@ -243,10 +337,9 @@ class ClosedLoop:
         logging.warning(
             "closed_loop %s: stall detected — error=%.4f mm (total stalls: %d)",
             self.name, err, self._tracker.stall_count)
-        # Use respond_info so the operator sees it immediately in the console.
         self._gcode.respond_info(
             "!! CLOSED_LOOP %s: stall detected! error=%.4f mm "
-            "(total stalls: %d; use CLOSED_LOOP_CORRECT AXIS=%s to recover)"
+            "(total stalls: %d; home the axis or use CLOSED_LOOP_CORRECT AXIS=%s)"
             % (self.name.upper(), err, self._tracker.stall_count, self.name))
 
     # =========================================================================
@@ -264,37 +357,29 @@ class ClosedLoop:
     def _apply_correction_cb(self, original_commanded, original_err):
         """Reactor callback wrapper — re-validates before moving."""
         try:
-            if not self._enabled or not self._tracker.has_data():
+            if not self._enabled or not self._tracker or not self._tracker.has_data():
                 return
-
-            # Re-check: state may have changed since the timer queued us.
             th_status = self._toolhead.get_status(None).get('status', '')
             if th_status != TOOLHEAD_IDLE_STATUS:
                 return
-
             commanded = self._toolhead.get_position()[self._axis_idx]
             needs, err = self._tracker.needs_correction(commanded)
             if not needs:
                 return
-
             self._apply_correction(commanded, err)
         finally:
             self._pending_correction = False
 
     def _apply_correction(self, commanded_mm, error_mm):
-        """Issue the correction move.  May be called from timer callback or gcode handler."""
-        sensor_mm = self._tracker.get_sensor_position()
-
-        # Build position vectors (full 4-axis: X Y Z E).
+        """Issue the correction move.  May be called from reactor callback or gcode."""
+        sensor_mm   = self._tracker.get_sensor_position()
         current_pos = list(self._toolhead.get_position())
 
-        # Where the axis actually is according to the sensor.
         actual_pos = list(current_pos)
-        actual_pos[self._axis_idx] = sensor_mm
+        actual_pos[self._axis_idx] = sensor_mm        # where we actually are
 
-        # Where the axis should be (unchanged; this is the correction target).
         target_pos = list(current_pos)
-        target_pos[self._axis_idx] = commanded_mm
+        target_pos[self._axis_idx] = commanded_mm     # where we need to be
 
         # Step 1: reconcile Klipper's internal position with sensor reality.
         self._toolhead.set_position(actual_pos)
@@ -302,13 +387,12 @@ class ClosedLoop:
         # Step 2: move back to the commanded position (executes the missing steps).
         self._toolhead.move(target_pos, self._corr_speed)
 
-        # Step 3: sync the gcode coordinate layer so the user-visible position
-        # remains consistent after the correction move.
+        # Step 3: sync the gcode coordinate layer so user-visible position stays consistent.
         self._gcode_move.reset_last_position()
 
         self._tracker.record_correction()
         logging.info(
-            "closed_loop %s: correction #%d — sensor=%.4f mm, commanded=%.4f mm, "
+            "closed_loop %s: correction #%d — sensor=%.4f mm  commanded=%.4f mm  "
             "error=%.4f mm",
             self.name, self._tracker.correction_count,
             sensor_mm, commanded_mm, error_mm)
@@ -318,6 +402,11 @@ class ClosedLoop:
     # =========================================================================
 
     def cmd_CLOSED_LOOP_STATUS(self, gcmd):
+        if not self._tracker or not self._tracker.has_data():
+            gcmd.respond_info(
+                "CLOSED_LOOP [%s]: not homed — home the axis to activate"
+                % self.name)
+            return
         commanded  = self._toolhead.get_position()[self._axis_idx]
         sensor_pos = self._tracker.get_sensor_position()
         err        = self._tracker.compute_error(commanded)
@@ -326,14 +415,18 @@ class ClosedLoop:
             "error=%-12s  corrections=%d  stalls=%d"
             % (self.name,
                self._enabled,
-               "%.4f mm" % sensor_pos if sensor_pos is not None else "N/A",
+               "%.4f mm" % sensor_pos,
                "%.4f mm" % commanded,
-               "%.4f mm" % err        if err        is not None else "N/A",
+               "%.4f mm" % err,
                self._tracker.correction_count,
                self._tracker.stall_count))
 
     def cmd_CLOSED_LOOP_CORRECT(self, gcmd):
         """Force an immediate correction, waiting for any active moves to finish first."""
+        if not self._tracker or not self._tracker.has_data():
+            gcmd.respond_info(
+                "CLOSED_LOOP [%s]: axis not homed — cannot correct" % self.name)
+            return
         self._toolhead.wait_moves()
         commanded = self._toolhead.get_position()[self._axis_idx]
         needs, err = self._tracker.needs_correction(commanded)
@@ -360,12 +453,14 @@ class ClosedLoop:
     def get_status(self, eventtime=None):
         commanded = (self._toolhead.get_position()[self._axis_idx]
                      if self._toolhead else 0.)
+        tracker = self._tracker
         return {
             'enabled':         self._enabled,
-            'sensor_position': self._tracker.get_sensor_position(),
-            'error':           self._tracker.compute_error(commanded),
-            'corrections':     self._tracker.correction_count,
-            'stalls':          self._tracker.stall_count,
+            'is_homed':        tracker.has_data()          if tracker else False,
+            'sensor_position': tracker.get_sensor_position() if tracker else None,
+            'error':           tracker.compute_error(commanded) if tracker else None,
+            'corrections':     tracker.correction_count    if tracker else 0,
+            'stalls':          tracker.stall_count         if tracker else 0,
         }
 
 

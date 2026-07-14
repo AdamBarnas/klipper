@@ -33,8 +33,15 @@ class ChirpTestGenerator:
                                         minval=self.min_freq, maxval=300.)
         self.max_freq_z = config.getfloat('max_freq_z', 100.,
                                           minval=self.min_freq, maxval=300.)
-        self.accel_per_hz = config.getfloat('accel_per_hz', 60., above=0.)
-        self.accel_per_hz_z = config.getfloat('accel_per_hz_z', 15.,
+        # A pure sine at amplitude A puts all its energy at its own
+        # frequency, while resonance_tester.py's bang-bang square wave of
+        # the same peak amplitude A has a fundamental Fourier component of
+        # (4/pi)*A ~= 1.27*A - its harmonics carry the rest. To get
+        # excitation at the target frequency comparable to TEST_RESONANCES
+        # (rather than ~21% weaker), these defaults are scaled up from
+        # resonance_tester.py's 60/15 by that same 4/pi factor.
+        self.accel_per_hz = config.getfloat('accel_per_hz', 76., above=0.)
+        self.accel_per_hz_z = config.getfloat('accel_per_hz_z', 19.,
                                               above=0.)
         self.duration = config.getfloat('duration', 60., above=1.)
         self.sweep_type = config.get('sweep_type', 'log').lower()
@@ -70,11 +77,20 @@ class ChirpTestGenerator:
         # cycle - the same "constant within a short segment" approximation
         # resonance_tester.py's own generator already relies on, just
         # subdivided finer to approximate a sine instead of a square wave.
+        #
+        # Each cycle's sample-and-hold sine only returns velocity (not
+        # position) to its starting value, so consecutive cycles otherwise
+        # accumulate a one-directional net displacement over the whole
+        # sweep. Flipping the sign every other cycle - the same trick
+        # resonance_tester.py's own generator uses (see its "sign"
+        # variable) - makes consecutive cycles mirror images so this
+        # per-cycle offset cancels instead of compounding.
         freq = self.freq_start
         n_seg = self.test_segments_per_cycle
         res = []
         t = 0.
         two_pi = 2. * math.pi
+        sign = 1.
         if self.test_sweep_type == 'log':
             log_rate = (math.log(self.freq_end / self.freq_start)
                         / self.test_duration)
@@ -83,7 +99,7 @@ class ChirpTestGenerator:
                     / self.test_duration
         while freq <= self.freq_end + 0.000001:
             t_seg = 1. / (n_seg * freq)
-            accel_amp = self.test_accel_per_hz * freq
+            accel_amp = sign * self.test_accel_per_hz * freq
             for i in range(n_seg):
                 t += t_seg
                 phase = two_pi * (i + 1) / n_seg
@@ -93,6 +109,7 @@ class ChirpTestGenerator:
                 freq *= math.exp(log_rate * t_cycle)
             else:
                 freq += hz_per_sec * t_cycle
+            sign = -sign
         return res
     def get_max_freq(self):
         return self.freq_end

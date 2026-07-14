@@ -97,6 +97,28 @@ class ChirpTestGenerator:
     def get_max_freq(self):
         return self.freq_end
 
+def _peak_abs_displacement(test_seq):
+    # Offline replay of the same (time, accel, freq) -> position
+    # integration ResonanceTestExecutor.run_test performs move-by-move,
+    # just to find the largest excursion from the start position before
+    # any moves are actually issued (used to auto-scale the sweep to fit
+    # the requested X/Y travel window - see cmd_TEST_CHIRP below).
+    last_v = last_t = 0.
+    pos = 0.
+    peak = 0.
+    for next_t, accel, freq in test_seq:
+        t_seg = next_t - last_t
+        if abs(accel) < 0.000001:
+            d = last_v * t_seg
+        else:
+            v = last_v + accel * t_seg
+            d = (v * v - last_v * last_v) * (.5 / accel)
+            last_v = v
+        pos += d
+        peak = max(peak, abs(pos))
+        last_t = next_t
+    return peak
+
 class ChirpTester:
     def __init__(self, config):
         self.printer = config.get_printer()
@@ -120,19 +142,17 @@ class ChirpTester:
 
         axis = resonance_tester._parse_axis(gcmd, gcmd.get("AXIS").lower())
 
-        test_point = gcmd.get("POINT", None)
-        if test_point:
-            coords = test_point.split(',')
-            if len(coords) != 3:
-                raise gcmd.error("Invalid POINT parameter, must be 'x,y,z'")
-            try:
-                test_point = [float(p.strip()) for p in coords]
-            except ValueError:
-                raise gcmd.error(
-                        "Invalid POINT parameter, must be 'x,y,z' where"
-                        " x, y and z are valid floating point numbers")
-        elif rt.probe_points:
-            test_point = list(rt.probe_points[0])
+        # Keep the whole test inside a safe X/Y travel window: center the
+        # test on the middle of the window (rather than resonance_tester's
+        # probe_points, which can sit right on a boundary) and, once the
+        # sweep is generated below, auto-scale its amplitude down if the
+        # projected excursion would otherwise leave the window.
+        x_min = gcmd.get_float("X_MIN", 100.)
+        x_max = gcmd.get_float("X_MAX", 200., minval=x_min)
+        y_min = gcmd.get_float("Y_MIN", 100.)
+        y_max = gcmd.get_float("Y_MAX", 200., minval=y_min)
+        tpos = toolhead.get_position()
+        test_point = [(x_min + x_max) / 2., (y_min + y_max) / 2., tpos[2]]
 
         chips_str = gcmd.get("CHIPS", None)
         accel_chips = rt._parse_chips(chips_str) if chips_str else None
@@ -170,6 +190,31 @@ class ChirpTester:
                     " plan - consider a shorter DURATION, higher"
                     " FREQ_START, or fewer SEGMENTS_PER_CYCLE"
                     % len(test_seq))
+
+        # Scale the sweep down (uniformly - the system is linear in accel
+        # amplitude, so this doesn't distort the frequency content) if its
+        # projected excursion would carry X or Y outside the requested
+        # window. dir_x/dir_y are the vibration direction's components
+        # along X/Y; a pure AXIS=x or AXIS=y test only has one of them
+        # non-zero, so the other axis just stays fixed at the window's
+        # center and is trivially within range.
+        dir_x, dir_y = axis.get_dir()[0], axis.get_dir()[1]
+        half_ranges = []
+        if abs(dir_x) > 0.000001:
+            half_ranges.append(((x_max - x_min) / 2.) / abs(dir_x))
+        if abs(dir_y) > 0.000001:
+            half_ranges.append(((y_max - y_min) / 2.) / abs(dir_y))
+        if half_ranges:
+            half_range = min(half_ranges)
+            peak = _peak_abs_displacement(test_seq)
+            if peak > half_range:
+                scale = half_range / peak
+                test_seq = [(t, a * scale, f) for t, a, f in test_seq]
+                gcmd.respond_info(
+                        "Chirp amplitude scaled by %.3fx (peak excursion"
+                        " was %.1f mm) to keep the sweep within"
+                        " X=[%.0f,%.0f] Y=[%.0f,%.0f]"
+                        % (scale, peak, x_min, x_max, y_min, y_max))
 
         if test_point:
             toolhead.manual_move(test_point, rt.move_speed)

@@ -176,6 +176,10 @@ config WANT_SENSOR_ANGLE
     bool
     depends on WANT_SPI
     default y
+config WANT_CLOSED_LOOP_STEPPER
+    bool
+    depends on WANT_SENSOR_ANGLE
+    default y
 config NEED_SENSOR_BULK
     bool
     depends on WANT_ADXL345 || WANT_LIS2DW || WANT_BMI160 || WANT_MPU9250 || WANT_ICM20948 \
@@ -263,6 +267,9 @@ config WANT_LDC1612
 config WANT_SENSOR_ANGLE
     bool "Support angle sensors"
     depends on WANT_SPI
+config WANT_CLOSED_LOOP_STEPPER
+    bool "Support realtime closed-loop stepper correction from angle sensors"
+    depends on WANT_SENSOR_ANGLE
 comment "Other features"
     depends on WANT_ADC || WANT_HX71X || WANT_ADS1220 || WANT_LDC1612
 config WANT_TRIGGER_ANALOG

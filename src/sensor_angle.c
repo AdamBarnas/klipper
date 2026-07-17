@@ -10,6 +10,7 @@
 #include "board/irq.h" // irq_disable
 #include "command.h" // DECL_COMMAND
 #include "sched.h" // DECL_TASK
+#include "sensor_angle.h" // spi_angle_get_latest
 #include "sensor_bulk.h" // sensor_bulk_report
 #include "spicmds.h" // spidev_transfer
 
@@ -50,6 +51,11 @@ struct spi_angle {
     struct spidev_s *spi;
     uint8_t flags, chip_type, time_shift, overflow;
     struct sensor_bulk sb;
+    // Most recent successfully decoded sample, kept outside of "sb" so a
+    // realtime consumer (e.g. closed_loop_stepper.c) can peek at it without
+    // interfering with the bulk-streaming buffer used for host telemetry.
+    uint32_t last_time, last_angle;
+    uint8_t last_valid;
 };
 
 enum {
@@ -122,6 +128,12 @@ static void
 angle_add_data(struct spi_angle *sa, uint32_t stime, uint32_t mtime
                , uint_fast16_t angle)
 {
+    // Record the freshest raw sample regardless of the schedule check below -
+    // the angle value itself is valid even if this sample's timing info isn't.
+    sa->last_time = mtime;
+    sa->last_angle = angle;
+    sa->last_valid = 1;
+
     uint32_t tdiff = mtime - stime;
     if (sa->time_shift)
         tdiff = (tdiff + (1<<(sa->time_shift - 1))) >> sa->time_shift;
@@ -383,6 +395,27 @@ command_spi_angle_transfer(uint32_t *args)
           , oid, mtime, data_len, data);
 }
 DECL_COMMAND(command_spi_angle_transfer, "spi_angle_transfer oid=%c data=%*s");
+
+// Return the 'struct spi_angle' for a given oid (for use by other C modules)
+struct spi_angle *
+spi_angle_oid_lookup(uint8_t oid)
+{
+    return oid_lookup(oid, command_config_spi_angle);
+}
+
+// Fetch the most recently decoded sample without disturbing the bulk
+// streaming buffer used for host telemetry.  Returns 0 if no sample has
+// been taken yet.
+int
+spi_angle_get_latest(struct spi_angle *sa, uint32_t *time, uint32_t *angle)
+{
+    irq_disable();
+    uint8_t valid = sa->last_valid;
+    *time = sa->last_time;
+    *angle = sa->last_angle;
+    irq_enable();
+    return valid;
+}
 
 // Background task that performs measurements
 void

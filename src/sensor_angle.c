@@ -417,6 +417,25 @@ spi_angle_get_latest(struct spi_angle *sa, uint32_t *time, uint32_t *angle)
     return valid;
 }
 
+// Number of bits the "angle" value actually occupies before it wraps back
+// to 0 - i.e. the value returned by spi_angle_get_latest() (and streamed to
+// the host) is in [0, 1<<bits).  Most chips are shifted up to fill the full
+// 16-bit field (mt6816_query()/mt6826s_query()/etc all produce a value that
+// wraps at 65536), but mt6835_query() shifts its 21-bit register down to a
+// bare 14-bit value (angle_raw >> 7) with no further scaling here - the host
+// (angle.py's is_14bit handling) rescales it to 16-bit for its OWN
+// wraparound math, but that rescale never happens to sa->last_angle.
+// Callers doing their own wraparound-safe deltas (closed_loop_stepper.c)
+// need the true modulus, not an assumed fixed 16 bits, or a rollover reads
+// as a huge spurious jump instead of a small in-range step.
+int
+spi_angle_get_angle_bits(struct spi_angle *sa)
+{
+    if (sa->chip_type == SA_CHIP_MT6835)
+        return 14;
+    return 16;
+}
+
 // Background task that performs measurements
 void
 spi_angle_task(void)

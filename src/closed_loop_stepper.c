@@ -36,9 +36,15 @@ struct closed_loop_stepper {
     struct spi_angle *angle;
 
     // Config (uploaded once at config_closed_loop_stepper time)
-    int32_t ratio_q16;          // signed Q16.16 steps-per-raw-angle-count
+    int32_t ratio_q16;          // signed Q16.16 steps-per-angle-count, where
+                                 // "angle-count" assumes a full 65536-count
+                                 // revolution (matches angle.py's ANGLE_BITS)
     uint32_t deadband_q16;      // Q16.16 steps - accumulated error threshold
     uint32_t min_interval_ticks; // rate limiter: min ticks between corrections
+    uint8_t angle_shift;        // normalises a sensor's native angle range up
+                                 // to the full 65536-count assumption above
+                                 // (0 for 16-bit chips, 2 for mt6835's 14-bit
+                                 // native range) - see spi_angle_get_angle_bits()
 
     // Live tracking state (reset whenever (re)started via the query command)
     uint32_t prev_angle_raw;
@@ -78,6 +84,7 @@ command_config_closed_loop_stepper(uint32_t *args)
     cls->ratio_q16 = args[3];
     cls->deadband_q16 = args[4];
     cls->min_interval_ticks = args[5];
+    cls->angle_shift = 16 - spi_angle_get_angle_bits(cls->angle);
 }
 DECL_COMMAND(command_config_closed_loop_stepper,
              "config_closed_loop_stepper oid=%c stepper_oid=%c angle_oid=%c"
@@ -127,6 +134,13 @@ closed_loop_stepper_check(struct closed_loop_stepper *cls)
     uint32_t angle_time, angle_raw;
     if (!spi_angle_get_latest(cls->angle, &angle_time, &angle_raw))
         return;
+    // Normalise to a full 0..65535 range so both the wraparound diff below
+    // and ratio_q16 (which assumes a 65536-count revolution) are correct
+    // regardless of the sensor's native bit width (e.g. mt6835 only fills
+    // the bottom 14 bits - without this, a rollover there reads as a huge
+    // spurious ~2^14-count jump instead of a small in-range step, and even
+    // non-rollover moves would be undercounted by 4x).
+    angle_raw <<= cls->angle_shift;
 
     irq_disable();
     uint32_t stepper_pos = stepper_get_position(cls->stepper);

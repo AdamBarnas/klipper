@@ -57,7 +57,9 @@ class ClosedLoopStepper:
 
         self._mcu = None
         self._mcu_stepper = None
+        self._angle_obj = None
         self._angle_oid = None
+        self._angle_subscribed = False
         self._oid = None
         self._cmd_queue = None
         self._query_cmd = None
@@ -110,7 +112,9 @@ class ClosedLoopStepper:
                 "closed_loop_stepper %s: sensor '%s' must be on the same mcu"
                 " as stepper '%s'" % (self.name, self._sensor_name,
                                       self._stepper_name))
+        self._angle_obj = angle_obj
         self._angle_oid = angle_obj.oid
+        self._angle_subscribed = False
         if self._poll_interval is None:
             self._poll_interval = angle_obj.sample_period
 
@@ -167,8 +171,24 @@ class ClosedLoopStepper:
     # MCU start/stop
     # =========================================================================
 
+    def _angle_batch_handler(self, msg):
+        # We don't use the streamed samples themselves - the firmware task
+        # reads its own "latest sample" side-channel directly off the MCU.
+        # Subscribing here is what keeps the angle sensor's SPI polling loop
+        # running at all: bulk_sensor.BatchBulkHelper only samples while at
+        # least one client is registered (angle.py's add_client()), which is
+        # also why closed_loop.py subscribes for its own idle-jog checks.
+        # Returning False here drops our subscription once disabled.
+        if not self._enabled:
+            self._angle_subscribed = False
+            return False
+        return True
+
     def _send_enable(self, enable):
         if enable:
+            if not self._angle_subscribed:
+                self._angle_subscribed = True
+                self._angle_obj.add_client(self._angle_batch_handler)
             systime = self._reactor.monotonic()
             print_time = self._mcu.estimated_print_time(systime) + MIN_MSG_TIME
             reqclock = self._mcu.print_time_to_clock(print_time)

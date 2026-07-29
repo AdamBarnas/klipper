@@ -14,9 +14,16 @@
 #
 # If the referenced [angle <sensor>] section has already been calibrated via
 # ANGLE_CALIBRATE (i.e. it has a "calibrate:" table, normally saved into
-# printer.cfg's SAVE_CONFIG block), that same table is uploaded to the
-# firmware corrector too, so it linearises the raw sensor reading the same
-# way angle.py's own AngleCalibration does before computing error.
+# printer.cfg's SAVE_CONFIG block) and use_calibration is enabled, that same
+# table is uploaded to the firmware corrector too, so it linearises the raw
+# sensor reading the same way angle.py's own AngleCalibration does before
+# computing error.
+#
+# use_calibration defaults to False: a 2026-07-19 test hit a sign-flip
+# runaway immediately after wiring the (reused) calibration_reversed flag
+# in - that flag's sign was chosen for angle.py's own stepper-phase
+# alignment use, which needs independent verification before trusting it
+# here for axis-position error. Leave this off until that's confirmed.
 #
 # Config:
 #   [closed_loop_stepper x]
@@ -60,6 +67,12 @@ class ClosedLoopStepper:
             'max_correction_steps_per_sec', 200., above=0.)
         self._poll_interval = config.getfloat('poll_interval', None, above=0.)
         self._enable_on_start = config.getboolean('enable_on_start', True)
+        # Default OFF pending verification that AngleCalibration's
+        # calibration_reversed sign convention (chosen for angle.py's own
+        # stepper-phase alignment use) actually matches what this corrector
+        # needs (axis position, not phase) - a 2026-07-19 test run into a
+        # sign-flip runaway immediately after this was first wired up.
+        self._use_calibration = config.getboolean('use_calibration', False)
 
         self._mcu = None
         self._mcu_stepper = None
@@ -131,9 +144,13 @@ class ClosedLoopStepper:
         # .calibration is empty if "stepper:" is set but calibrate: data isn't
         # - either way, that just means no calibration to upload.
         angle_cal = angle_obj.calibration
-        self._calibration = list(getattr(angle_cal, 'calibration', []))
-        self._calibration_reversed = getattr(
-            angle_cal, 'calibration_reversed', False)
+        if self._use_calibration:
+            self._calibration = list(getattr(angle_cal, 'calibration', []))
+            self._calibration_reversed = getattr(
+                angle_cal, 'calibration_reversed', False)
+        else:
+            self._calibration = []
+            self._calibration_reversed = False
 
         ratio = self._ratio_override
         if ratio is None:

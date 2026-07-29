@@ -10,6 +10,7 @@
 #include "board/irq.h" // irq_disable
 #include "command.h" // DECL_COMMAND
 #include "sched.h" // DECL_TASK
+#include "sensor_angle.h" // spi_angle_get_latest
 #include "sensor_bulk.h" // sensor_bulk_report
 #include "spicmds.h" // spidev_transfer
 
@@ -50,6 +51,11 @@ struct spi_angle {
     struct spidev_s *spi;
     uint8_t flags, chip_type, time_shift, overflow;
     struct sensor_bulk sb;
+    // Most recent successfully decoded sample, kept outside of "sb" so a
+    // realtime consumer (e.g. closed_loop_stepper.c) can peek at it without
+    // interfering with the bulk-streaming buffer used for host telemetry.
+    uint32_t last_time, last_angle;
+    uint8_t last_valid;
 };
 
 enum {
@@ -122,6 +128,12 @@ static void
 angle_add_data(struct spi_angle *sa, uint32_t stime, uint32_t mtime
                , uint_fast16_t angle)
 {
+    // Record the freshest raw sample regardless of the schedule check below -
+    // the angle value itself is valid even if this sample's timing info isn't.
+    sa->last_time = mtime;
+    sa->last_angle = angle;
+    sa->last_valid = 1;
+
     uint32_t tdiff = mtime - stime;
     if (sa->time_shift)
         tdiff = (tdiff + (1<<(sa->time_shift - 1))) >> sa->time_shift;
@@ -383,6 +395,46 @@ command_spi_angle_transfer(uint32_t *args)
           , oid, mtime, data_len, data);
 }
 DECL_COMMAND(command_spi_angle_transfer, "spi_angle_transfer oid=%c data=%*s");
+
+// Return the 'struct spi_angle' for a given oid (for use by other C modules)
+struct spi_angle *
+spi_angle_oid_lookup(uint8_t oid)
+{
+    return oid_lookup(oid, command_config_spi_angle);
+}
+
+// Fetch the most recently decoded sample without disturbing the bulk
+// streaming buffer used for host telemetry.  Returns 0 if no sample has
+// been taken yet.
+int
+spi_angle_get_latest(struct spi_angle *sa, uint32_t *time, uint32_t *angle)
+{
+    irq_disable();
+    uint8_t valid = sa->last_valid;
+    *time = sa->last_time;
+    *angle = sa->last_angle;
+    irq_enable();
+    return valid;
+}
+
+// Number of bits the "angle" value actually occupies before it wraps back
+// to 0 - i.e. the value returned by spi_angle_get_latest() (and streamed to
+// the host) is in [0, 1<<bits).  Most chips are shifted up to fill the full
+// 16-bit field (mt6816_query()/mt6826s_query()/etc all produce a value that
+// wraps at 65536), but mt6835_query() shifts its 21-bit register down to a
+// bare 14-bit value (angle_raw >> 7) with no further scaling here - the host
+// (angle.py's is_14bit handling) rescales it to 16-bit for its OWN
+// wraparound math, but that rescale never happens to sa->last_angle.
+// Callers doing their own wraparound-safe deltas (closed_loop_stepper.c)
+// need the true modulus, not an assumed fixed 16 bits, or a rollover reads
+// as a huge spurious jump instead of a small in-range step.
+int
+spi_angle_get_angle_bits(struct spi_angle *sa)
+{
+    if (sa->chip_type == SA_CHIP_MT6835)
+        return 14;
+    return 16;
+}
 
 // Background task that performs measurements
 void

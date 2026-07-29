@@ -248,7 +248,7 @@ DECL_COMMAND(command_config_stepper, "config_stepper oid=%c step_pin=%c"
              " dir_pin=%c invert_step=%c step_pulse_ticks=%u");
 
 // Return the 'struct stepper' for a given stepper oid
-static struct stepper *
+struct stepper *
 stepper_oid_lookup(uint8_t oid)
 {
     return oid_lookup(oid, command_config_stepper);
@@ -317,7 +317,7 @@ command_reset_step_clock(uint32_t *args)
 DECL_COMMAND(command_reset_step_clock, "reset_step_clock oid=%c clock=%u");
 
 // Return the current stepper position.  Caller must disable irqs.
-static uint32_t
+uint32_t
 stepper_get_position(struct stepper *s)
 {
     uint32_t position = s->position;
@@ -344,6 +344,58 @@ command_stepper_get_position(uint32_t *args)
     sendf("stepper_position oid=%c pos=%i", oid, position - POSITION_BIAS);
 }
 DECL_COMMAND(command_stepper_get_position, "stepper_get_position oid=%c");
+
+// Inject a single out-of-band correction step, independent of the normal
+// queue_step move queue.  Used by closed_loop_stepper.c to nudge a stepper's
+// position by exactly one step based on encoder feedback, without touching
+// stepper_event()/stepper_load_next()/s->mq.  Must be called from task
+// context (not a timer/IRQ handler); it briefly disables irqs itself.
+//
+// s->position's raw ledger always increases by 1 for a step taken in
+// whatever direction is "currently active" (stepper_load_next negates the
+// ledger on every direction reversal so this stays true across reversals),
+// and stepper_get_position() reports -position when position's top bit is
+// set. So: to make stepper_get_position() go up by 1, we take a step in the
+// pin polarity that increases the raw ledger when the top bit is clear, or
+// in the opposite polarity when the top bit is set - hence the same_dir
+// check below rather than a fixed direction convention.
+void
+stepper_apply_correction_step(struct stepper *s, int_fast8_t want_increase)
+{
+    irq_disable();
+    uint32_t position = s->position;
+    if (s->flags & SF_SINGLE_SCHED)
+        position -= s->count;
+    else
+        position -= s->count / 2;
+    int_fast8_t same_dir = !(position & 0x80000000) == !!want_increase;
+
+    if (!same_dir) {
+        gpio_out_toggle_noirq(s->dir_pin);
+        uint32_t mid = timer_read_time() + s->step_pulse_ticks;
+        while (timer_is_before(timer_read_time(), mid))
+            ;
+    }
+
+    gpio_out_toggle_noirq(s->step_pin);
+    if (!(s->flags & SF_SINGLE_SCHED)) {
+        // Traditional step/dir driver: pulse then return step pin to rest
+        uint32_t end = timer_read_time() + s->step_pulse_ticks;
+        while (timer_is_before(timer_read_time(), end))
+            ;
+        gpio_out_toggle_noirq(s->step_pin);
+    }
+
+    if (!same_dir) {
+        gpio_out_toggle_noirq(s->dir_pin);
+        uint32_t end2 = timer_read_time() + s->step_pulse_ticks;
+        while (timer_is_before(timer_read_time(), end2))
+            ;
+    }
+
+    s->position += same_dir ? 1 : (uint32_t)-1;
+    irq_enable();
+}
 
 // Stop all moves for a given stepper (caller must disable IRQs)
 static void

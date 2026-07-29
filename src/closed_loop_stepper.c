@@ -13,13 +13,14 @@
 // stepper_apply_correction_step() (see stepper.c) in whichever direction
 // closes the gap.
 //
-// Scope note: this works on the RAW (uncalibrated, unlinearized) angle
-// sample from sensor_angle.c, not the host's calibrated/direction-corrected
-// accumulated angle (klippy/extras/angle.py) - replicating that calibration
-// table on an FPU-less Cortex-M0+ inside a realtime loop is out of scope.
+// The angle sample is optionally passed through the same 64-bucket linear
+// calibration table klippy/extras/angle.py's AngleCalibration builds (via
+// ANGLE_CALIBRATE), uploaded once at config time - see apply_calibration()
+// below, which is an integer-only port of AngleCalibration.apply_calibration().
 // The signed "ratio" gain uploaded at config time is expected to absorb the
-// axis's direction sense; this is a coarse slip corrector, not a precision
-// position source.
+// axis's direction sense (independent of calibration_reversed, which instead
+// mirrors AngleCalibration's own sensor-orientation flip); this is a coarse
+// slip corrector, not a precision position source.
 
 #include "basecmd.h" // oid_alloc
 #include "board/misc.h" // timer_read_time
@@ -28,6 +29,13 @@
 #include "sched.h" // DECL_TASK
 #include "sensor_angle.h" // spi_angle_get_latest
 #include "stepper.h" // stepper_get_position
+
+// Matches klippy/extras/angle.py's CALIBRATION_BITS/ANGLE_BITS constants
+#define CAL_BUCKETS 64
+#define CAL_TABLE_SIZE (CAL_BUCKETS + 1)
+#define CAL_INTERP_BITS 10             // ANGLE_BITS(16) - CALIBRATION_BITS(6)
+#define CAL_INTERP_MASK ((1u << CAL_INTERP_BITS) - 1)
+#define CAL_INTERP_ROUND (1 << (CAL_INTERP_BITS - 1))
 
 struct closed_loop_stepper {
     struct timer timer;
@@ -41,10 +49,13 @@ struct closed_loop_stepper {
                                  // revolution (matches angle.py's ANGLE_BITS)
     uint32_t deadband_q16;      // Q16.16 steps - accumulated error threshold
     uint32_t min_interval_ticks; // rate limiter: min ticks between corrections
-    uint8_t angle_shift;        // normalises a sensor's native angle range up
-                                 // to the full 65536-count assumption above
-                                 // (0 for 16-bit chips, 2 for mt6835's 14-bit
-                                 // native range) - see spi_angle_get_angle_bits()
+    uint8_t calibration_reversed;
+
+    // Calibration table (uploaded via config_closed_loop_stepper_calibration,
+    // one entry at a time; has_calibration stays 0 - bypassing the lookup -
+    // until at least one entry has actually been uploaded)
+    int32_t calibration[CAL_TABLE_SIZE];
+    uint8_t has_calibration;
 
     // Live tracking state (reset whenever (re)started via the query command)
     uint32_t prev_angle_raw;
@@ -84,11 +95,29 @@ command_config_closed_loop_stepper(uint32_t *args)
     cls->ratio_q16 = args[3];
     cls->deadband_q16 = args[4];
     cls->min_interval_ticks = args[5];
-    cls->angle_shift = 16 - spi_angle_get_angle_bits(cls->angle);
+    cls->calibration_reversed = args[6];
 }
 DECL_COMMAND(command_config_closed_loop_stepper,
              "config_closed_loop_stepper oid=%c stepper_oid=%c angle_oid=%c"
-             " ratio=%i deadband=%u min_interval_ticks=%u");
+             " ratio=%i deadband=%u min_interval_ticks=%u"
+             " calibration_reversed=%c");
+
+// Upload one calibration table entry (sent CAL_TABLE_SIZE times at config
+// time by closed_loop_stepper.py, mirroring AngleCalibration.calibration).
+void
+command_config_closed_loop_stepper_calibration(uint32_t *args)
+{
+    struct closed_loop_stepper *cls = oid_lookup(
+        args[0], command_config_closed_loop_stepper);
+    uint8_t index = args[1];
+    if (index >= CAL_TABLE_SIZE)
+        shutdown("Invalid closed_loop_stepper calibration index");
+    cls->calibration[index] = args[2];
+    cls->has_calibration = 1;
+}
+DECL_COMMAND(command_config_closed_loop_stepper_calibration,
+             "config_closed_loop_stepper_calibration oid=%c index=%c"
+             " value=%i");
 
 // Start/stop periodic correction.  rest_ticks==0 stops and clears state.
 void
@@ -127,6 +156,29 @@ command_closed_loop_stepper_get_state(uint32_t *args)
 DECL_COMMAND(command_closed_loop_stepper_get_state,
              "closed_loop_stepper_get_state oid=%c");
 
+// Integer port of klippy/extras/angle.py's AngleCalibration.apply_calibration
+// for a single 16-bit raw sample (no multi-turn accumulation needed here -
+// the caller only ever uses wraparound-safe deltas between two calibrated
+// samples, so working directly in the 0..65535 domain is sufficient).
+static uint32_t
+apply_calibration(struct closed_loop_stepper *cls, uint32_t angle)
+{
+    if (!cls->has_calibration)
+        return angle;
+    uint32_t bucket = (angle & 0xffff) >> CAL_INTERP_BITS;
+    int32_t cal1 = cls->calibration[bucket];
+    int32_t cal2 = cls->calibration[bucket + 1];
+    int32_t frac = (int32_t)(angle & CAL_INTERP_MASK);
+    int32_t adj = cal1 + ((frac * (cal2 - cal1) + CAL_INTERP_ROUND)
+                          >> CAL_INTERP_BITS);
+    uint32_t angle_diff = ((uint32_t)adj - angle) & 0xffff;
+    int32_t signed_diff = (int16_t)angle_diff;
+    uint32_t new_angle = (angle + (uint32_t)signed_diff) & 0xffff;
+    if (cls->calibration_reversed)
+        new_angle = (uint32_t)(-(int32_t)new_angle) & 0xffff;
+    return new_angle;
+}
+
 // Run one correction cycle for a single stepper/angle pair
 static void
 closed_loop_stepper_check(struct closed_loop_stepper *cls)
@@ -134,13 +186,7 @@ closed_loop_stepper_check(struct closed_loop_stepper *cls)
     uint32_t angle_time, angle_raw;
     if (!spi_angle_get_latest(cls->angle, &angle_time, &angle_raw))
         return;
-    // Normalise to a full 0..65535 range so both the wraparound diff below
-    // and ratio_q16 (which assumes a 65536-count revolution) are correct
-    // regardless of the sensor's native bit width (e.g. mt6835 only fills
-    // the bottom 14 bits - without this, a rollover there reads as a huge
-    // spurious ~2^14-count jump instead of a small in-range step, and even
-    // non-rollover moves would be undercounted by 4x).
-    angle_raw <<= cls->angle_shift;
+    angle_raw = apply_calibration(cls, angle_raw);
 
     irq_disable();
     uint32_t stepper_pos = stepper_get_position(cls->stepper);

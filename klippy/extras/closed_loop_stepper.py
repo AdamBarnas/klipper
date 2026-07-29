@@ -12,6 +12,12 @@
 # Moonraker.  Complements (does not replace) the existing idle-only
 # klippy/extras/closed_loop.py.
 #
+# If the referenced [angle <sensor>] section has already been calibrated via
+# ANGLE_CALIBRATE (i.e. it has a "calibrate:" table, normally saved into
+# printer.cfg's SAVE_CONFIG block), that same table is uploaded to the
+# firmware corrector too, so it linearises the raw sensor reading the same
+# way angle.py's own AngleCalibration does before computing error.
+#
 # Config:
 #   [closed_loop_stepper x]
 #   stepper: stepper_x               # defaults to stepper_<axis>
@@ -118,6 +124,17 @@ class ClosedLoopStepper:
         if self._poll_interval is None:
             self._poll_interval = angle_obj.sample_period
 
+        # Reuse the same calibration table ANGLE_CALIBRATE already built for
+        # this sensor (AngleCalibration.calibration - a list of CAL_TABLE_SIZE
+        # ints). Both attributes are absent entirely if the [angle] section
+        # has no "stepper:" set (AngleCalibration.__init__ returns early), and
+        # .calibration is empty if "stepper:" is set but calibrate: data isn't
+        # - either way, that just means no calibration to upload.
+        angle_cal = angle_obj.calibration
+        self._calibration = list(getattr(angle_cal, 'calibration', []))
+        self._calibration_reversed = getattr(
+            angle_cal, 'calibration_reversed', False)
+
         ratio = self._ratio_override
         if ratio is None:
             rotation_dist, steps_per_rotation = \
@@ -145,8 +162,14 @@ class ClosedLoopStepper:
         self._mcu.add_config_cmd(
             "config_closed_loop_stepper oid=%d stepper_oid=%d angle_oid=%d"
             " ratio=%d deadband=%d min_interval_ticks=%d"
+            " calibration_reversed=%d"
             % (self._oid, stepper_oid, self._angle_oid,
-               self._ratio_q16, self._deadband_q16, min_interval_ticks))
+               self._ratio_q16, self._deadband_q16, min_interval_ticks,
+               int(self._calibration_reversed)))
+        for index, value in enumerate(self._calibration):
+            self._mcu.add_config_cmd(
+                "config_closed_loop_stepper_calibration oid=%d index=%d"
+                " value=%d" % (self._oid, index, int(value)))
         self._mcu.add_config_cmd(
             "query_closed_loop_stepper oid=%d clock=0 rest_ticks=0"
             % (self._oid,), on_restart=True)

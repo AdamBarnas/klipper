@@ -257,7 +257,11 @@ static void mt6835_query(struct spi_angle *sa, uint32_t stime)
     else if (crc != crc_received)
         angle_add_error(sa, SE_CRC);
     else
-        angle_add_data(sa, stime, mtime2, angle_raw >> 7);
+        // Shift the 21-bit register down to a full 16-bit value (0..65535)
+        // instead of the coarser 14-bit form (>>7) - keeps the reported
+        // angle in the same native range as every other supported chip, so
+        // downstream wraparound/ratio math doesn't need special-casing.
+        angle_add_data(sa, stime, mtime2, angle_raw >> 5);
 }
 
 static void mt6826s_query(struct spi_angle *sa, uint32_t stime)
@@ -415,25 +419,6 @@ spi_angle_get_latest(struct spi_angle *sa, uint32_t *time, uint32_t *angle)
     *angle = sa->last_angle;
     irq_enable();
     return valid;
-}
-
-// Number of bits the "angle" value actually occupies before it wraps back
-// to 0 - i.e. the value returned by spi_angle_get_latest() (and streamed to
-// the host) is in [0, 1<<bits).  Most chips are shifted up to fill the full
-// 16-bit field (mt6816_query()/mt6826s_query()/etc all produce a value that
-// wraps at 65536), but mt6835_query() shifts its 21-bit register down to a
-// bare 14-bit value (angle_raw >> 7) with no further scaling here - the host
-// (angle.py's is_14bit handling) rescales it to 16-bit for its OWN
-// wraparound math, but that rescale never happens to sa->last_angle.
-// Callers doing their own wraparound-safe deltas (closed_loop_stepper.c)
-// need the true modulus, not an assumed fixed 16 bits, or a rollover reads
-// as a huge spurious jump instead of a small in-range step.
-int
-spi_angle_get_angle_bits(struct spi_angle *sa)
-{
-    if (sa->chip_type == SA_CHIP_MT6835)
-        return 14;
-    return 16;
 }
 
 // Background task that performs measurements

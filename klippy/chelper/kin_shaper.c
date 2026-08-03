@@ -20,11 +20,16 @@
 
 static const int KIN_FLAGS[3] = { AF_X, AF_Y, AF_Z };
 
+// Largest single-mode shaper (3hump_ei) has 5 impulses; the dual-mode
+// shapers in shaper_defs.py's MULTI_MODE_SHAPERS convolve two 3-impulse
+// shapers (mzv2, zvd2, ei2), giving up to 3*3=9 impulses.
+#define MAX_SHAPER_PULSES 9
+
 struct shaper_pulses {
     int num_pulses;
     struct {
         double t, a;
-    } pulses[5];
+    } pulses[MAX_SHAPER_PULSES];
 };
 
 // Shift pulses around 'mid-point' t=0 so that the input shaper is an identity

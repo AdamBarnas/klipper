@@ -1801,7 +1801,9 @@ the [command reference](G-Codes.md#input_shaper).
 #shaper_type_z:
 #   If shaper_type is not set, these parameters can be used to
 #   configure different input shapers for X, Y, and Z axes. The same
-#   values are supported as for shaper_type parameter.
+#   values are supported as for shaper_type parameter, plus the
+#   dual-mode shapers zv2, mzv2, zvd2, and ei2 (see shaper_freq2_x
+#   below).
 #damping_ratio_x: 0.1
 #damping_ratio_y: 0.1
 #damping_ratio_z: 0.1
@@ -1809,6 +1811,25 @@ the [command reference](G-Codes.md#input_shaper).
 #   to improve vibration suppression. Default value is 0.1 which is a
 #   good all-round value for most printers. In most circumstances this
 #   parameter requires no tuning and should not be changed.
+#shaper_freq2_x: 0
+#shaper_freq2_y: 0
+#shaper_freq2_z: 0
+#   A second resonant frequency (in Hz) for the axis, only used when
+#   shaper_type is one of zv2, mzv2, zvd2, or ei2. Some axes are not
+#   well described by a single resonant mode -- e.g. an axis driven by
+#   two independently coupled motors can show two separate resonances
+#   -- and these dual-mode shapers cancel both simultaneously (they
+#   convolve two single-mode shapers, one tuned to shaper_freq_<axis>/
+#   damping_ratio_<axis>, the other to shaper_freq2_<axis>/
+#   damping_ratio2_<axis>). Must be set to a nonzero value to use a
+#   dual-mode shaper_type; the shaper's duration (and hence corner
+#   smoothing) is the sum of both single-mode shapers' durations. The
+#   default value is 0.
+#damping_ratio2_x: 0.1
+#damping_ratio2_y: 0.1
+#damping_ratio2_z: 0.1
+#   Damping ratio of the second resonant mode, only used together with
+#   shaper_freq2_<axis> above. Default value is 0.1.
 ```
 
 ### [adxl345]

@@ -11,46 +11,85 @@ from . import shaper_defs
 class InputShaperParams:
     def __init__(self, axis, config):
         self.axis = axis
+        self.error = config.error
         self.shapers = {s.name : s for s in shaper_defs.INPUT_SHAPERS}
+        self.multi_mode_shapers = {
+                s.name : s for s in shaper_defs.MULTI_MODE_SHAPERS}
         shaper_type = config.get('shaper_type', 'mzv')
         self.shaper_type = config.get('shaper_type_' + axis, shaper_type)
-        if self.shaper_type not in self.shapers:
-            raise config.error(
-                    'Unsupported shaper type: %s' % (self.shaper_type,))
+        shaper_cfg = self._lookup_shaper_cfg(self.shaper_type, config.error)
         self.damping_ratio = config.getfloat(
                 'damping_ratio_' + axis,
                 shaper_defs.DEFAULT_DAMPING_RATIO, minval=0.,
-                maxval=self.shapers[self.shaper_type].max_damping_ratio)
+                maxval=shaper_cfg.max_damping_ratio)
         self.shaper_freq = config.getfloat('shaper_freq_' + axis, 0., minval=0.)
+        # Second mode, only used for multi-mode shapers (e.g. mzv2), see
+        # klippy/extras/shaper_defs.py, MULTI_MODE_SHAPERS. Left at 0 /
+        # default for the common single-mode case.
+        self.damping_ratio2 = config.getfloat(
+                'damping_ratio2_' + axis,
+                shaper_defs.DEFAULT_DAMPING_RATIO, minval=0.,
+                maxval=shaper_cfg.max_damping_ratio)
+        self.shaper_freq2 = config.getfloat(
+                'shaper_freq2_' + axis, 0., minval=0.)
+    def _lookup_shaper_cfg(self, shaper_type, error):
+        cfg = self.shapers.get(shaper_type, self.multi_mode_shapers.get(
+                shaper_type))
+        if cfg is None:
+            raise error('Unsupported shaper type: %s' % (shaper_type,))
+        return cfg
+    def _is_multi_mode(self, shaper_type):
+        return shaper_type in self.multi_mode_shapers
     def update(self, gcmd):
         axis = self.axis.upper()
         shaper_type = gcmd.get('SHAPER_TYPE', None)
         if shaper_type is None:
             shaper_type = gcmd.get('SHAPER_TYPE_' + axis, self.shaper_type)
-        if shaper_type.lower() not in self.shapers:
-            raise gcmd.error('Unsupported shaper type: %s' % (shaper_type,))
+        shaper_type = shaper_type.lower()
+        shaper_cfg = self._lookup_shaper_cfg(shaper_type, gcmd.error)
         damping_ratio = gcmd.get_float('DAMPING_RATIO_' + axis,
                                        self.damping_ratio, minval=0.)
-        if damping_ratio > self.shapers[shaper_type.lower()].max_damping_ratio:
+        damping_ratio2 = gcmd.get_float('DAMPING_RATIO2_' + axis,
+                                        self.damping_ratio2, minval=0.)
+        if damping_ratio > shaper_cfg.max_damping_ratio or (
+                self._is_multi_mode(shaper_type) and
+                damping_ratio2 > shaper_cfg.max_damping_ratio):
             raise gcmd.error(
                     'Too high value of damping_ratio=%.3f for shaper %s'
                     ' on axis %c' % (damping_ratio, shaper_type, axis))
         self.shaper_freq = gcmd.get_float('SHAPER_FREQ_' + axis,
                                           self.shaper_freq, minval=0.)
+        self.shaper_freq2 = gcmd.get_float('SHAPER_FREQ2_' + axis,
+                                           self.shaper_freq2, minval=0.)
         self.damping_ratio = damping_ratio
-        self.shaper_type = shaper_type.lower()
+        self.damping_ratio2 = damping_ratio2
+        self.shaper_type = shaper_type
+        self.error = gcmd.error
     def get_shaper(self):
         if not self.shaper_freq:
             A, T = shaper_defs.get_none_shaper()
+        elif self._is_multi_mode(self.shaper_type):
+            if not self.shaper_freq2:
+                raise self.error(
+                        "shaper_freq2_%s must be set to use multi-mode "
+                        "shaper '%s' on axis %s" % (
+                            self.axis, self.shaper_type, self.axis))
+            A, T = self.multi_mode_shapers[self.shaper_type].init_func(
+                    self.shaper_freq, self.damping_ratio,
+                    self.shaper_freq2, self.damping_ratio2)
         else:
             A, T = self.shapers[self.shaper_type].init_func(
                     self.shaper_freq, self.damping_ratio)
         return len(A), A, T
     def get_status(self):
-        return collections.OrderedDict([
+        status = collections.OrderedDict([
             ('shaper_type', self.shaper_type),
             ('shaper_freq', '%.3f' % (self.shaper_freq,)),
             ('damping_ratio', '%.6f' % (self.damping_ratio,))])
+        if self._is_multi_mode(self.shaper_type):
+            status['shaper_freq2'] = '%.3f' % (self.shaper_freq2,)
+            status['damping_ratio2'] = '%.6f' % (self.damping_ratio2,)
+        return status
 
 class AxisInputShaper:
     def __init__(self, axis, config):

@@ -846,12 +846,19 @@ been enabled (also see the
 [DAMPING_RATIO_X=<damping_ratio_x>] [DAMPING_RATIO_Y=<damping_ratio_y>]
 [DAMPING_RATIO_Z=<damping_ratio_z>] [SHAPER_TYPE=<shaper>]
 [SHAPER_TYPE_X=<shaper_type_x>] [SHAPER_TYPE_Y=<shaper_type_y>]
-[SHAPER_TYPE_Z=<shaper_type_z>]`:
+[SHAPER_TYPE_Z=<shaper_type_z>] [SHAPER_FREQ2_X=<shaper_freq2_x>]
+[SHAPER_FREQ2_Y=<shaper_freq2_y>] [SHAPER_FREQ2_Z=<shaper_freq2_z>]
+[DAMPING_RATIO2_X=<damping_ratio2_x>]
+[DAMPING_RATIO2_Y=<damping_ratio2_y>]
+[DAMPING_RATIO2_Z=<damping_ratio2_z>]`:
 Modify input shaper parameters. Note that SHAPER_TYPE parameter resets
 input shaper for all axes even if different shaper types have
 been configured in [input_shaper] section. SHAPER_TYPE cannot be used
 together with any of SHAPER_TYPE_X, SHAPER_TYPE_Y, and SHAPER_TYPE_Z
-parameters. See [config reference](Config_Reference.md#input_shaper)
+parameters. The SHAPER_FREQ2_* / DAMPING_RATIO2_* parameters only apply
+when the corresponding axis uses one of the dual-mode shaper types
+(zv2, mzv2, zvd2, ei2). See
+[config reference](Config_Reference.md#input_shaper)
 for more details on each of these parameters.
 
 ### [led]

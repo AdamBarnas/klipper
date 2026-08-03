@@ -119,3 +119,86 @@ INPUT_SHAPERS = [
     InputShaperCfg(name='3hump_ei', init_func=get_3hump_ei_shaper,
                    min_freq=48., max_damping_ratio=0.2),
 ]
+
+######################################################################
+# Multi-mode (4th-order+) input shapers
+#
+# A single-mode shaper above places one pair of zeros in the vibration
+# transfer function (eq:vibration_transfer in Klipper_input_shaping.tex),
+# tuned to cancel exactly one resonant mode (f_n, damping_ratio). Real
+# axes are not always well described by a single second-order oscillator
+# -- e.g. an axis driven by two independently-coupled motors can show two
+# separate resonant modes, making it effectively a 4th-order system (two
+# independent complex pole pairs; see the empirical fits in
+# Klipper_input_shaping.tex section 2.7).
+#
+# Convolving two impulse sequences multiplies their vibration-transfer
+# functions: A_{S1*S2}(w) = A_S1(w) * A_S2(w). If S1 is built to zero
+# vibrations exactly at (f1, zeta1), that zero survives in the product
+# regardless of what S2 does there (one factor is zero), and
+# symmetrically for S2 at (f2, zeta2). So convolving a shaper tuned to
+# mode 1 with one tuned to mode 2 cancels both modes simultaneously.
+# This is the standard "multi-mode input shaping" construction (Singer &
+# Seering, 1990; Hyde & Seering, 1991) -- note ZVD above is exactly this
+# construction applied to ZV convolved with itself (same mode twice).
+######################################################################
+
+def convolve_shapers(A1, T1, A2, T2):
+    # Convolve two (A, T) impulse trains. Impulses landing at the same
+    # time are merged (amplitudes added), so the combined shaper has at
+    # most len(A1)*len(A2) impulses. Not normalized (consistent with the
+    # single-mode get_*_shaper functions above; callers already divide by
+    # sum(A) wherever a unit DC gain is required).
+    combined = {}
+    for a1, t1 in zip(A1, T1):
+        for a2, t2 in zip(A2, T2):
+            t = t1 + t2
+            combined[t] = combined.get(t, 0.) + a1 * a2
+    T = sorted(combined.keys())
+    A = [combined[t] for t in T]
+    return (A, T)
+
+def get_multi_mode_shaper(base_init_func, shaper_freq, damping_ratio,
+                          shaper_freq2, damping_ratio2):
+    A1, T1 = base_init_func(shaper_freq, damping_ratio)
+    A2, T2 = base_init_func(shaper_freq2, damping_ratio2)
+    return convolve_shapers(A1, T1, A2, T2)
+
+def get_zv2_shaper(shaper_freq, damping_ratio, shaper_freq2, damping_ratio2):
+    return get_multi_mode_shaper(get_zv_shaper, shaper_freq, damping_ratio,
+                                 shaper_freq2, damping_ratio2)
+
+def get_mzv2_shaper(shaper_freq, damping_ratio, shaper_freq2, damping_ratio2):
+    return get_multi_mode_shaper(get_mzv_shaper, shaper_freq, damping_ratio,
+                                 shaper_freq2, damping_ratio2)
+
+def get_zvd2_shaper(shaper_freq, damping_ratio, shaper_freq2, damping_ratio2):
+    return get_multi_mode_shaper(get_zvd_shaper, shaper_freq, damping_ratio,
+                                 shaper_freq2, damping_ratio2)
+
+def get_ei2_shaper(shaper_freq, damping_ratio, shaper_freq2, damping_ratio2):
+    return get_multi_mode_shaper(get_ei_shaper, shaper_freq, damping_ratio,
+                                 shaper_freq2, damping_ratio2)
+
+MultiModeShaperCfg = collections.namedtuple(
+        'MultiModeShaperCfg',
+        ('name', 'init_func', 'min_freq', 'max_damping_ratio'))
+
+# Dual-mode shapers: each convolves two instances of the corresponding
+# single-mode shaper above, one per resonant mode. Their init_func takes
+# 4 arguments (shaper_freq, damping_ratio, shaper_freq2, damping_ratio2)
+# instead of 2, so these are intentionally kept out of INPUT_SHAPERS /
+# AUTOTUNE_SHAPERS -- shaper_calibrate.py's auto-tuning only searches a
+# single frequency and everywhere calls init_func(freq, damping_ratio).
+# See klippy/extras/input_shaper.py for how shaper_freq2_<axis> /
+# damping_ratio2_<axis> are configured to use these.
+MULTI_MODE_SHAPERS = [
+    MultiModeShaperCfg(name='zv2', init_func=get_zv2_shaper,
+                       min_freq=21., max_damping_ratio=0.99),
+    MultiModeShaperCfg(name='mzv2', init_func=get_mzv2_shaper,
+                       min_freq=23., max_damping_ratio=0.99),
+    MultiModeShaperCfg(name='zvd2', init_func=get_zvd2_shaper,
+                       min_freq=29., max_damping_ratio=0.99),
+    MultiModeShaperCfg(name='ei2', init_func=get_ei2_shaper,
+                       min_freq=29., max_damping_ratio=0.4),
+]

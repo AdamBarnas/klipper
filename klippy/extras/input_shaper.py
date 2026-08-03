@@ -38,7 +38,7 @@ class InputShaperParams:
         if cfg is None:
             raise error('Unsupported shaper type: %s' % (shaper_type,))
         return cfg
-    def _is_multi_mode(self, shaper_type):
+    def is_multi_mode(self, shaper_type):
         return shaper_type in self.multi_mode_shapers
     def update(self, gcmd):
         axis = self.axis.upper()
@@ -49,26 +49,47 @@ class InputShaperParams:
         shaper_cfg = self._lookup_shaper_cfg(shaper_type, gcmd.error)
         damping_ratio = gcmd.get_float('DAMPING_RATIO_' + axis,
                                        self.damping_ratio, minval=0.)
-        damping_ratio2 = gcmd.get_float('DAMPING_RATIO2_' + axis,
-                                        self.damping_ratio2, minval=0.)
+        # Read SHAPER_FREQ2_*/DAMPING_RATIO2_* as optional (default None)
+        # so we can tell whether the user actually passed them this
+        # command, separately from falling back to the stored value.
+        freq2_param = gcmd.get_float('SHAPER_FREQ2_' + axis, None, minval=0.)
+        damping_ratio2_param = gcmd.get_float(
+                'DAMPING_RATIO2_' + axis, None, minval=0.)
+        damping_ratio2 = damping_ratio2_param
+        if damping_ratio2 is None:
+            damping_ratio2 = self.damping_ratio2
         if damping_ratio > shaper_cfg.max_damping_ratio or (
-                self._is_multi_mode(shaper_type) and
+                self.is_multi_mode(shaper_type) and
                 damping_ratio2 > shaper_cfg.max_damping_ratio):
             raise gcmd.error(
                     'Too high value of damping_ratio=%.3f for shaper %s'
                     ' on axis %c' % (damping_ratio, shaper_type, axis))
+        if not self.is_multi_mode(shaper_type) and (
+                freq2_param is not None or damping_ratio2_param is not None):
+            gcmd.respond_info(
+                    "Note: SHAPER_FREQ2_%s / DAMPING_RATIO2_%s have no "
+                    "effect with shaper_type '%s' on axis %s -- it is not "
+                    "a dual-mode shaper. Use one of: %s" % (
+                        axis, axis, shaper_type, axis,
+                        ', '.join(sorted(self.multi_mode_shapers))))
         self.shaper_freq = gcmd.get_float('SHAPER_FREQ_' + axis,
                                           self.shaper_freq, minval=0.)
-        self.shaper_freq2 = gcmd.get_float('SHAPER_FREQ2_' + axis,
-                                           self.shaper_freq2, minval=0.)
+        if freq2_param is not None:
+            self.shaper_freq2 = freq2_param
         self.damping_ratio = damping_ratio
         self.damping_ratio2 = damping_ratio2
         self.shaper_type = shaper_type
         self.error = gcmd.error
+        if self.is_multi_mode(shaper_type) and not self.shaper_freq2:
+            gcmd.respond_info(
+                    "Warning: shaper_type '%s' on axis %s is a dual-mode "
+                    "shaper but shaper_freq2_%s is not set yet -- shaping "
+                    "will fail to activate until it is." % (
+                        shaper_type, axis, axis))
     def get_shaper(self):
         if not self.shaper_freq:
             A, T = shaper_defs.get_none_shaper()
-        elif self._is_multi_mode(self.shaper_type):
+        elif self.is_multi_mode(self.shaper_type):
             if not self.shaper_freq2:
                 raise self.error(
                         "shaper_freq2_%s must be set to use multi-mode "
@@ -86,7 +107,7 @@ class InputShaperParams:
             ('shaper_type', self.shaper_type),
             ('shaper_freq', '%.3f' % (self.shaper_freq,)),
             ('damping_ratio', '%.6f' % (self.damping_ratio,))])
-        if self._is_multi_mode(self.shaper_type):
+        if self.is_multi_mode(self.shaper_type):
             status['shaper_freq2'] = '%.3f' % (self.shaper_freq2,)
             status['damping_ratio2'] = '%.6f' % (self.damping_ratio2,)
         return status
@@ -130,6 +151,16 @@ class AxisInputShaper:
         info = ' '.join(["%s_%s:%s" % (key, self.axis, value)
                          for (key, value) in self.params.get_status().items()])
         gcmd.respond_info(info)
+        if self.params.is_multi_mode(self.params.shaper_type) and \
+                self.params.shaper_freq2:
+            gcmd.respond_info(
+                    "Axis %s: dual-mode shaper '%s' -- mode 1 = %.1f Hz "
+                    "(damping_ratio=%.3f), mode 2 = %.1f Hz "
+                    "(damping_ratio2=%.3f)" % (
+                        self.axis.upper(), self.params.shaper_type,
+                        self.params.shaper_freq, self.params.damping_ratio,
+                        self.params.shaper_freq2,
+                        self.params.damping_ratio2))
 
 class InputShaper:
     def __init__(self, config):

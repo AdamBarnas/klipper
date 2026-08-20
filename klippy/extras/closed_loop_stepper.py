@@ -20,22 +20,72 @@
 #                                     #   override; auto-derived from the
 #                                     #   stepper's rotation_distance otherwise
 #   invert_ratio: False              # flip the sign of the auto-derived ratio
-#   deadband_steps: 2.0              # accumulated error (in steps) before correcting
+#   deadband_steps: 2.0              # error (in steps) below which nothing acts
+#                                     #   (noise/hysteresis floor, all modes)
 #   max_correction_steps_per_sec: 200 # hard rate limiter on injected steps
 #   poll_interval: <float>           # seconds between MCU correction checks;
 #                                     #   defaults to the angle sensor's own
 #                                     #   sample_period
 #   enable_on_start: True
 #
+#   control_mode: bang_bang          # bang_bang (default, relay/hysteresis,
+#                                     #   unchanged legacy behaviour) | p | pid
+#   kp: 0.0                          # proportional gain (steps out per step
+#                                     #   of error); required (>0) for p/pid.
+#                                     #   Capped at 2.0: the discrete recursion
+#                                     #   e[k+1]=(1-kp)*e[k] this reduces to in
+#                                     #   isolation is only stable for kp<2.
+#   ki: 0.0                          # integral gain; pid mode only, capped at
+#                                     #   1.0. Clamped anti-windup accumulator,
+#                                     #   see max_integral_steps.
+#   kd: 0.0                          # derivative gain; pid mode only, capped
+#                                     #   at 2.0. Runs through a fixed internal
+#                                     #   low-pass filter (raw angle is noisy).
+#   max_integral_steps: <float>      # anti-windup clamp on the I accumulator;
+#                                     #   defaults to 10x deadband_steps
+#   max_error_steps: <float>         # panic/watchdog threshold on the
+#                                     #   accumulated error - correction is
+#                                     #   latched off (fault) if ever exceeded,
+#                                     #   in any mode; defaults to
+#                                     #   max(50, 25x deadband_steps)
+#
 # GCode commands (AXIS=<name> selects the instance):
-#   CLOSED_LOOP_STEPPER_STATUS  AXIS=x
-#   CLOSED_LOOP_STEPPER_ENABLE  AXIS=x ENABLE=0|1
+#   CLOSED_LOOP_STEPPER_STATUS    AXIS=x
+#   CLOSED_LOOP_STEPPER_ENABLE    AXIS=x ENABLE=0|1  # ENABLE=1 also clears a
+#                                                     # latched fault (full
+#                                                     # state reset on the MCU)
+#   CLOSED_LOOP_STEPPER_SET_MODE  AXIS=x [MODE=bang_bang|p|pid] [KP=<float>]
+#                                  [KI=<float>] [KD=<float>]
+#     Changes control_mode/kp/ki/kd on the fly, no RESTART needed - any
+#     parameter left out keeps its current value. Does NOT clear a latched
+#     fault (use CLOSED_LOOP_STEPPER_ENABLE for that) and does NOT touch
+#     deadband_steps/max_integral_steps/max_error_steps/
+#     max_correction_steps_per_sec, which remain config-only.
 
 import logging
 
 MIN_MSG_TIME = 0.100
 STATUS_POLL_TIME = 1.0
 ANGLE_BITS = 16  # angle module normalises all sensors to 0..65535 per revolution
+
+CONTROL_MODES = {'bang_bang': 0, 'p': 1, 'pid': 2}
+
+
+def _check_gains(mode_name, kp, ki, kd):
+    # Shared between config-time validation (__init__) and runtime
+    # validation (CLOSED_LOOP_STEPPER_SET_MODE) so the two can never drift
+    # apart. Returns an error message string if the combination is unsafe/
+    # nonsensical, or None if it's fine. (kp/ki/kd upper bounds themselves
+    # are enforced by the minval/maxval on the respective getfloat/get_float
+    # calls at each call site, not here.)
+    if mode_name == 'bang_bang':
+        return None
+    if kp <= 0.:
+        return "control_mode=%s requires kp > 0" % (mode_name,)
+    if mode_name == 'p' and (ki or kd):
+        return ("control_mode=p does not use ki/kd - set control_mode=pid"
+                " to use them")
+    return None
 
 
 class ClosedLoopStepper:
@@ -55,6 +105,40 @@ class ClosedLoopStepper:
         self._poll_interval = config.getfloat('poll_interval', None, above=0.)
         self._enable_on_start = config.getboolean('enable_on_start', True)
 
+        self._control_mode_name = config.getchoice(
+            'control_mode', CONTROL_MODES, default='bang_bang')
+        # kp/ki/kd upper bounds aren't arbitrary: kp<=2.0 is the stability
+        # bound of the discrete recursion e[k+1]=(1-kp)*e[k] that a P-only
+        # controller reduces to here (deadbeat at kp=1, oscillating but still
+        # bounded up to kp=2). ki/kd have no equally clean closed-form bound
+        # given the combined loop, so their caps are deliberately conservative
+        # given this MCU has no FPU and only sees the raw, uncalibrated angle.
+        self._kp = config.getfloat('kp', 0., minval=0., maxval=2.0)
+        self._ki = config.getfloat('ki', 0., minval=0., maxval=1.0)
+        self._kd = config.getfloat('kd', 0., minval=0., maxval=2.0)
+        self._max_integral_steps = config.getfloat(
+            'max_integral_steps', None, above=0.)
+        self._max_error_steps = config.getfloat(
+            'max_error_steps', None, above=0.)
+
+        if self._control_mode_name == 'bang_bang':
+            if self._kp or self._ki or self._kd:
+                logging.warning(
+                    "closed_loop_stepper %s: kp/ki/kd are set but"
+                    " control_mode=bang_bang ignores them (set"
+                    " control_mode=p or control_mode=pid to use them)",
+                    self.name)
+        else:
+            err = _check_gains(
+                self._control_mode_name, self._kp, self._ki, self._kd)
+            if err:
+                raise self.printer.config_error(
+                    "closed_loop_stepper %s: %s" % (self.name, err))
+        if self._max_integral_steps is None:
+            self._max_integral_steps = 10. * self._deadband_steps
+        if self._max_error_steps is None:
+            self._max_error_steps = max(50., 25. * self._deadband_steps)
+
         self._mcu = None
         self._mcu_stepper = None
         self._angle_obj = None
@@ -64,12 +148,14 @@ class ClosedLoopStepper:
         self._cmd_queue = None
         self._query_cmd = None
         self._get_state_cmd = None
+        self._set_gains_cmd = None
         self._reactor = self.printer.get_reactor()
         self._status_timer = None
 
         self._enabled = False
         self._corrected_steps = 0
         self._error_steps = 0.
+        self._fault = False
 
         # klippy:mcu_identify fires after all config sections (including
         # toolhead/kinematics/steppers) are constructed, but strictly before
@@ -93,6 +179,11 @@ class ClosedLoopStepper:
             self.cmd_CLOSED_LOOP_STEPPER_ENABLE,
             desc="Enable or disable realtime closed-loop stepper correction"
                  " (ENABLE=0|1)")
+        gcode.register_mux_command(
+            'CLOSED_LOOP_STEPPER_SET_MODE', 'AXIS', self.name,
+            self.cmd_CLOSED_LOOP_STEPPER_SET_MODE,
+            desc="Change control_mode/kp/ki/kd at runtime, no RESTART"
+                 " needed (MODE=bang_bang|p|pid KP= KI= KD=)")
 
     # =========================================================================
     # Setup
@@ -129,6 +220,12 @@ class ClosedLoopStepper:
                 ratio = -ratio
         self._ratio_q16 = int(round(ratio * 65536.))
         self._deadband_q16 = int(round(self._deadband_steps * 65536.))
+        self._control_mode = CONTROL_MODES[self._control_mode_name]
+        self._kp_q16 = int(round(self._kp * 65536.))
+        self._ki_q16 = int(round(self._ki * 65536.))
+        self._kd_q16 = int(round(self._kd * 65536.))
+        self._max_integral_q16 = int(round(self._max_integral_steps * 65536.))
+        self._panic_error_q16 = int(round(self._max_error_steps * 65536.))
 
         self._oid = self._mcu.create_oid()
         self._cmd_queue = self._mcu.alloc_command_queue()
@@ -142,11 +239,21 @@ class ClosedLoopStepper:
         stepper_oid = self._mcu_stepper.get_oid()
         min_interval_ticks = max(1, int(self._mcu.seconds_to_clock(
             1.0 / self._max_correction_rate)))
+        # P/PID mode isn't gated per-step like bang-bang - it can apply
+        # several correction steps in a single check cycle. Cap that count so
+        # max_correction_steps_per_sec still means the same thing (a hard
+        # ceiling on injected steps/sec) regardless of control_mode.
+        max_steps_per_check = max(1, int(round(
+            self._max_correction_rate * self._poll_interval)))
         self._mcu.add_config_cmd(
             "config_closed_loop_stepper oid=%d stepper_oid=%d angle_oid=%d"
-            " ratio=%d deadband=%d min_interval_ticks=%d"
+            " ratio=%d deadband=%d min_interval_ticks=%d mode=%d kp=%d ki=%d"
+            " kd=%d max_integral=%d panic_error=%d max_steps_per_check=%d"
             % (self._oid, stepper_oid, self._angle_oid,
-               self._ratio_q16, self._deadband_q16, min_interval_ticks))
+               self._ratio_q16, self._deadband_q16, min_interval_ticks,
+               self._control_mode, self._kp_q16, self._ki_q16, self._kd_q16,
+               self._max_integral_q16, self._panic_error_q16,
+               max_steps_per_check))
         self._mcu.add_config_cmd(
             "query_closed_loop_stepper oid=%d clock=0 rest_ticks=0"
             % (self._oid,), on_restart=True)
@@ -155,13 +262,22 @@ class ClosedLoopStepper:
             cq=self._cmd_queue)
         self._get_state_cmd = self._mcu.lookup_query_command(
             "closed_loop_stepper_get_state oid=%c",
-            "closed_loop_stepper_state oid=%c corrected_steps=%i error_q16=%i",
+            "closed_loop_stepper_state oid=%c corrected_steps=%i error_q16=%i"
+            " fault=%c",
             oid=self._oid, cq=self._cmd_queue)
+        self._set_gains_cmd = self._mcu.lookup_command(
+            "set_closed_loop_stepper_gains oid=%c mode=%c kp=%i ki=%i kd=%i",
+            cq=self._cmd_queue)
         logging.info(
             "closed_loop_stepper %s: connected - stepper=%s sensor='angle %s'"
-            " ratio_q16=%d deadband_q16=%d min_interval_ticks=%d",
+            " control_mode=%s ratio_q16=%d deadband_q16=%d"
+            " min_interval_ticks=%d kp_q16=%d ki_q16=%d kd_q16=%d"
+            " max_integral_q16=%d panic_error_q16=%d max_steps_per_check=%d",
             self.name, self._stepper_name, self._sensor_name,
-            self._ratio_q16, self._deadband_q16, min_interval_ticks)
+            self._control_mode_name, self._ratio_q16, self._deadband_q16,
+            min_interval_ticks, self._kp_q16, self._ki_q16, self._kd_q16,
+            self._max_integral_q16, self._panic_error_q16,
+            max_steps_per_check)
 
     def _handle_ready(self):
         if self._enable_on_start:
@@ -203,11 +319,22 @@ class ClosedLoopStepper:
     # Status polling (for logging / get_status / gcode reporting)
     # =========================================================================
 
+    def _update_state(self, params):
+        self._corrected_steps = params['corrected_steps']
+        self._error_steps = params['error_q16'] / 65536.
+        fault = bool(params.get('fault', 0))
+        if fault and not self._fault:
+            logging.warning(
+                "closed_loop_stepper %s: FAULT latched on MCU (error"
+                " exceeded max_error_steps=%.3f) - correction stopped;"
+                " run CLOSED_LOOP_STEPPER_ENABLE AXIS=%s ENABLE=1 to"
+                " investigate and reset",
+                self.name, self._max_error_steps, self.name)
+        self._fault = fault
+
     def _status_poll_timer(self, eventtime):
         if self._enabled and self._get_state_cmd is not None:
-            params = self._get_state_cmd.send([self._oid])
-            self._corrected_steps = params['corrected_steps']
-            self._error_steps = params['error_q16'] / 65536.
+            self._update_state(self._get_state_cmd.send([self._oid]))
         return eventtime + STATUS_POLL_TIME
 
     # =========================================================================
@@ -216,13 +343,12 @@ class ClosedLoopStepper:
 
     def cmd_CLOSED_LOOP_STEPPER_STATUS(self, gcmd):
         if self._get_state_cmd is not None and self._enabled:
-            params = self._get_state_cmd.send([self._oid])
-            self._corrected_steps = params['corrected_steps']
-            self._error_steps = params['error_q16'] / 65536.
+            self._update_state(self._get_state_cmd.send([self._oid]))
         gcmd.respond_info(
-            "CLOSED_LOOP_STEPPER [%s]  enabled=%-5s  corrected_steps=%-8s"
-            "  error=%-10s"
-            % (self.name, self._enabled, self._corrected_steps,
+            "CLOSED_LOOP_STEPPER [%s]  mode=%-9s  enabled=%-5s"
+            "  fault=%-5s  corrected_steps=%-8s  error=%-10s"
+            % (self.name, self._control_mode_name, self._enabled,
+               self._fault, self._corrected_steps,
                "%.3f steps" % self._error_steps))
 
     def cmd_CLOSED_LOOP_STEPPER_ENABLE(self, gcmd):
@@ -232,6 +358,45 @@ class ClosedLoopStepper:
             "CLOSED_LOOP_STEPPER [%s]: %s"
             % (self.name, "enabled" if enable else "disabled"))
 
+    def cmd_CLOSED_LOOP_STEPPER_SET_MODE(self, gcmd):
+        if self._set_gains_cmd is None:
+            raise gcmd.error(
+                "closed_loop_stepper %s: not yet connected to its MCU"
+                % (self.name,))
+        mode_name = gcmd.get('MODE', self._control_mode_name)
+        if mode_name not in CONTROL_MODES:
+            raise gcmd.error(
+                "closed_loop_stepper %s: invalid MODE '%s' (must be one of:"
+                " %s)" % (self.name, mode_name,
+                          ', '.join(sorted(CONTROL_MODES))))
+        # Same bounds as the config-time kp/ki/kd (see __init__) - kp<=2.0 is
+        # the stability bound of the P-only recursion this control law
+        # reduces to; ki/kd caps are conservative for the same reasons noted
+        # there.
+        kp = gcmd.get_float('KP', self._kp, minval=0., maxval=2.0)
+        ki = gcmd.get_float('KI', self._ki, minval=0., maxval=1.0)
+        kd = gcmd.get_float('KD', self._kd, minval=0., maxval=2.0)
+        err = _check_gains(mode_name, kp, ki, kd)
+        if err:
+            raise gcmd.error("closed_loop_stepper %s: %s" % (self.name, err))
+        if mode_name == 'bang_bang' and (kp or ki or kd):
+            gcmd.respond_info(
+                "closed_loop_stepper %s: kp/ki/kd set but"
+                " control_mode=bang_bang ignores them" % (self.name,))
+
+        self._control_mode_name = mode_name
+        self._control_mode = CONTROL_MODES[mode_name]
+        self._kp, self._ki, self._kd = kp, ki, kd
+        self._kp_q16 = int(round(kp * 65536.))
+        self._ki_q16 = int(round(ki * 65536.))
+        self._kd_q16 = int(round(kd * 65536.))
+        self._set_gains_cmd.send(
+            [self._oid, self._control_mode, self._kp_q16, self._ki_q16,
+             self._kd_q16])
+        gcmd.respond_info(
+            "CLOSED_LOOP_STEPPER [%s]: control_mode=%s kp=%.4f ki=%.4f"
+            " kd=%.4f" % (self.name, mode_name, kp, ki, kd))
+
     # =========================================================================
     # Moonraker / status API
     # =========================================================================
@@ -239,6 +404,8 @@ class ClosedLoopStepper:
     def get_status(self, eventtime=None):
         return {
             'enabled': self._enabled,
+            'control_mode': self._control_mode_name,
+            'fault': self._fault,
             'corrected_steps': self._corrected_steps,
             'error_steps': self._error_steps,
         }

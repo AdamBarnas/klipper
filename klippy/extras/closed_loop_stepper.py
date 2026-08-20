@@ -106,7 +106,12 @@ class ClosedLoopStepper:
         self._enable_on_start = config.getboolean('enable_on_start', True)
 
         self._control_mode_name = config.getchoice(
-            'control_mode', CONTROL_MODES, default='bang_bang')
+            # getchoice() returns the DICT VALUE for the matched key, not
+            # the key itself - so this must map name->name (a list, per
+            # configfile.py's getchoice, becomes an identity dict) to get
+            # the string name back. CONTROL_MODES (name->int) is used
+            # separately below, once we actually need the MCU-side integer.
+            'control_mode', list(CONTROL_MODES.keys()), default='bang_bang')
         # kp/ki/kd upper bounds aren't arbitrary: kp<=2.0 is the stability
         # bound of the discrete recursion e[k+1]=(1-kp)*e[k] that a P-only
         # controller reduces to here (deadbeat at kp=1, oscillating but still
